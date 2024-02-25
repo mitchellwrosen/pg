@@ -1,0 +1,11 @@
+cabal-version: 3.0
+
+name: pg
+version: 0
+
+executable pg
+  build-depends:
+    base ^>= 4.18,
+  default-language: GHC2021
+  ghc-options: -Wall
+  main-is: Main.hs
