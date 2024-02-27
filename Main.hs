@@ -63,7 +63,7 @@ pgClusterCreate = do
         process
           "initdb"
           [ "--encoding=UTF8",
-            "--locale=en_US.UTF-8",
+            "--locale=C.UTF-8",
             "--no-sync",
             "--pgdata=" <> clusterDir
           ]
