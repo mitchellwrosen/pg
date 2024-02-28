@@ -2,12 +2,13 @@
 
 module Main (main) where
 
-import Control.Applicative (asum, (<|>))
+import Control.Applicative (asum)
 import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.Aeson qualified as Aeson
-import Data.Aeson.Types qualified as Aeson (Parser, parseField)
+import Data.Aeson.Types qualified as Aeson (Parser, parseField, parseFieldMaybe')
 import Data.ByteString qualified as ByteString
+import Data.Fixed (mod')
 import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Functor (void)
@@ -16,16 +17,21 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
+import Data.Text.Lazy.Builder qualified as Builder
+import Data.Text.Lazy.Builder.RealFloat qualified as Builder
+import GHC.Float.RealFracMethods (floorDoubleInt, roundDoubleInt)
 import Options.Applicative (optional)
 import Options.Applicative qualified as Opt
+import Prettyprinter qualified
+import Prettyprinter.Render.Terminal qualified
 import System.Directory qualified as Directory
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO qualified as IO
-import System.Posix qualified as Posix
+import System.Posix.ByteString qualified as Posix
 import System.Process qualified as Process
 import Text.Pretty.Simple (pPrint)
 import Text.Read (readMaybe)
-import Prelude hiding (lines, read)
+import Prelude hiding (filter, lines, read)
 
 main :: IO ()
 main = do
@@ -151,7 +157,139 @@ pgExplain maybeDatabase query = do
           Text.putStr out
           case Aeson.eitherDecodeStrictText @[Analyze] out of
             Left parseError -> Text.putStrLn (Text.pack parseError)
-            Right analyze -> pPrint (head analyze)
+            Right (head -> analyze) -> do
+              pPrint analyze
+              let bytesToDoc :: Int -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  bytesToDoc bytes =
+                    Prettyprinter.pretty bytes <> " bytes"
+                  costToDoc :: Double -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  costToDoc cost =
+                    let dollars = floorDoubleInt cost
+                        cents = roundDoubleInt (mod' cost 1 * 100)
+                        loop acc d
+                          | d < 1000 = d : acc
+                          | otherwise = let (x, y) = divMod d 1000 in loop (y : acc) x
+                        pp [] = ""
+                        pp [n] = Text.pack (show n)
+                        pp (n : ns) = Text.pack (show n) <> "," <> pp ns
+                     in Prettyprinter.pretty (pp (loop [] dollars))
+                          <> "."
+                          <> (if cents < 10 then "0" else mempty)
+                          <> Prettyprinter.pretty cents
+                  timeToDoc :: Double -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  timeToDoc ms
+                    | us < 0.5 = "0 us"
+                    | us < 995 = double 0 us <> " µs"
+                    | us < 9_950 = double 2 ms <> " ms"
+                    | us < 99_500 = double 1 ms <> " ms"
+                    | ms < 995 = double 0 ms <> " ms"
+                    | ms < 9_950 = double 2 s <> " s"
+                    | ms < 99_500 = double 1 s <> " s"
+                    | otherwise = double 0 s <> " s"
+                    where
+                      us = ms * 1000
+                      s = ms / 1_000
+                      double i =
+                        Prettyprinter.pretty . Builder.toLazyText . Builder.formatRealFloat Builder.Fixed (Just i)
+                  nodeInfoToDoc :: NodeInfo -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  nodeInfoToDoc info =
+                    -- how to show these?
+                    -- actualLoops :: Int
+                    -- parallelAware :: Bool
+                    Prettyprinter.vsep
+                      [ "Time: "
+                          <> timeToDoc (info.actualTotalTime * realToFrac @Int @Double info.actualLoops)
+                          <> " ("
+                          <> timeToDoc (info.actualStartupTime * realToFrac @Int @Double info.actualLoops)
+                          <> " to start, "
+                          <> timeToDoc ((info.actualTotalTime - info.actualStartupTime) * realToFrac @Int @Double info.actualLoops)
+                          <> " to execute)",
+                        "Cost: $" <> costToDoc info.totalCost <> " ($" <> costToDoc info.startupCost <> " to start, $" <> costToDoc (info.totalCost - info.startupCost) <> " to execute)",
+                        "Rows: "
+                          <> Prettyprinter.pretty (info.actualRows * info.actualLoops)
+                          <> " ("
+                          <> Prettyprinter.pretty (info.planRows * info.actualLoops)
+                          <> " predicted), "
+                          <> bytesToDoc info.planWidth
+                          <> " each"
+                      ]
+                  nodeToDoc :: Node -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  nodeToDoc = \case
+                    BitmapHeapScanNode info bitmapHeapScanInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Bitmap heap scan " <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapHeapScanInfo.relationName))
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc info
+                        <> nodesToDoc info.plans
+                    BitmapIndexScanNode info bitmapIndexScanInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Bitmap index scan using " <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapIndexScanInfo.indexName))
+                        <> ( case bitmapIndexScanInfo.indexCond of
+                               Nothing -> mempty
+                               Just cond -> ", " <> Prettyprinter.pretty cond
+                           )
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc info
+                        <> nodesToDoc info.plans
+                    IndexOnlyScanNode info indexScanInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Scan index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName))
+                        <> ( case indexScanInfo.indexCond of
+                               Nothing -> mempty
+                               Just cond -> ", " <> Prettyprinter.pretty cond
+                           )
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc info
+                        <> nodesToDoc info.plans
+                    IndexScanNode info indexScanInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Scan index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName) <> ", accessing table " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.relationName))
+                        <> ( case indexScanInfo.indexCond of
+                               Nothing -> mempty
+                               Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
+                           )
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc info
+                        <> nodesToDoc info.plans
+                    LimitNode info _limitInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Take the first " <> (if info.actualRows == 1 then "row" else Prettyprinter.pretty info.actualRows <> " rows"))
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc info
+                        <> nodesToDoc info.plans
+                    ResultNode info -> Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Result" <> nodesToDoc info.plans
+                    SeqScanNode info seqScanInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Seq scan " <> Prettyprinter.dquotes (Prettyprinter.pretty seqScanInfo.relationName))
+                        <> ( case seqScanInfo.filter of
+                               Nothing -> mempty
+                               Just s -> ", filter " <> Prettyprinter.pretty s
+                           )
+                        <> ( case seqScanInfo.rowsRemovedByFilter of
+                               Nothing -> mempty
+                               Just rows ->
+                                 " (removed "
+                                   <> Prettyprinter.pretty rows
+                                   <> if rows == 1 then " row)" else " rows)"
+                           )
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc info
+                        <> nodesToDoc info.plans
+                    SortNode info sortInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Sort on " <> Prettyprinter.pretty sortInfo.sortKey <> " using " <> Prettyprinter.pretty sortInfo.sortMethod)
+                        <> nodesToDoc info.plans
+                  nodesToDoc :: [Node] -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  nodesToDoc = \case
+                    [] -> mempty
+                    nodes ->
+                      Prettyprinter.line
+                        <> Prettyprinter.vsep (map ((\d -> "  ➤ " <> Prettyprinter.align d) . nodeToDoc) nodes)
+              let doc :: Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  doc =
+                    nodeToDoc analyze.plan
+                      <> Prettyprinter.line
+                      <> timeToDoc analyze.planningTime
+                      <> " to plan, "
+                      <> timeToDoc analyze.executionTime
+                      <> " to execute"
+              doc
+                & Prettyprinter.layoutPretty (Prettyprinter.LayoutOptions Prettyprinter.Unbounded)
+                & Prettyprinter.Render.Terminal.renderStrict
+                & Text.putStrLn
         else do
           Text.putStr out
           Text.putStr err
@@ -191,8 +329,10 @@ pgUp :: IO ()
 pgUp = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
+  let logFile = stateDir <> "/log.txt"
   Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
-    False ->
+    False -> do
+      Directory.createDirectoryIfMissing True (Text.unpack stateDir)
       background
         "postgres"
         [ "-D",
@@ -206,7 +346,9 @@ pgUp = do
           "-k",
           stateDir
         ]
-        (stateDir <> "/log.txt")
+        logFile
+      Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
+      void (foreground "tail" ["-f", logFile])
     True -> Text.putStrLn ("There's already a cluster running at " <> clusterDir)
 
 ------------------------------------------------------------------------------------------------------------------------
@@ -228,8 +370,107 @@ instance Aeson.FromJSON Analyze where
       planningTime <- Aeson.parseField @Double object "Planning Time"
       pure Analyze {..}
 
+data BitmapHeapScanNodeInfo = BitmapHeapScanNodeInfo
+  { alias :: !Text,
+    asyncCapable :: !Bool,
+    exactHeapBlocks :: !Int,
+    lossyHeapBlocks :: !Int,
+    recheckCond :: !Text,
+    relationName :: !Text,
+    rowsRemovedByIndexRecheck :: !(Maybe Int)
+  }
+  deriving stock (Show)
+
+parseBitmapHeapScanNodeInfo :: Aeson.Object -> Aeson.Parser BitmapHeapScanNodeInfo
+parseBitmapHeapScanNodeInfo object = do
+  alias <- Aeson.parseField @Text object "Alias"
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  exactHeapBlocks <- Aeson.parseField @Int object "Exact Heap Blocks"
+  lossyHeapBlocks <- Aeson.parseField @Int object "Lossy Heap Blocks"
+  recheckCond <- Aeson.parseField @Text object "Recheck Cond"
+  relationName <- Aeson.parseField @Text object "Relation Name"
+  rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
+  pure BitmapHeapScanNodeInfo {..}
+
+data BitmapIndexScanNodeInfo = BitmapIndexScanNodeInfo
+  { asyncCapable :: !Bool,
+    indexCond :: !(Maybe Text),
+    indexName :: !Text,
+    parentRelationship :: !Text
+  }
+  deriving stock (Show)
+
+parseBitmapIndexScanNodeInfo :: Aeson.Object -> Aeson.Parser BitmapIndexScanNodeInfo
+parseBitmapIndexScanNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
+  indexName <- Aeson.parseField @Text object "Index Name"
+  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
+  pure BitmapIndexScanNodeInfo {..}
+
+data IndexOnlyScanNodeInfo = IndexOnlyScanNodeInfo
+  { alias :: !Text,
+    asyncCapable :: !Bool,
+    heapFetches :: !Int,
+    indexCond :: !(Maybe Text),
+    indexName :: !Text,
+    relationName :: !Text,
+    rowsRemovedByIndexRecheck :: !(Maybe Int),
+    scanDirection :: !Text
+  }
+  deriving stock (Show)
+
+parseIndexOnlyScanNodeInfo :: Aeson.Object -> Aeson.Parser IndexOnlyScanNodeInfo
+parseIndexOnlyScanNodeInfo object = do
+  alias <- Aeson.parseField @Text object "Alias"
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  heapFetches <- Aeson.parseField @Int object "Heap Fetches"
+  indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
+  indexName <- Aeson.parseField @Text object "Index Name"
+  relationName <- Aeson.parseField @Text object "Relation Name"
+  rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
+  scanDirection <- Aeson.parseField @Text object "Scan Direction"
+  pure IndexOnlyScanNodeInfo {..}
+
+data IndexScanNodeInfo = IndexScanNodeInfo
+  { alias :: !Text,
+    asyncCapable :: !Bool,
+    indexCond :: !(Maybe Text),
+    indexName :: !Text,
+    relationName :: !Text,
+    rowsRemovedByIndexRecheck :: !(Maybe Int),
+    scanDirection :: !Text
+  }
+  deriving stock (Show)
+
+parseIndexScanNodeInfo :: Aeson.Object -> Aeson.Parser IndexScanNodeInfo
+parseIndexScanNodeInfo object = do
+  alias <- Aeson.parseField @Text object "Alias"
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
+  indexName <- Aeson.parseField @Text object "Index Name"
+  relationName <- Aeson.parseField @Text object "Relation Name"
+  rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
+  scanDirection <- Aeson.parseField @Text object "Scan Direction"
+  pure IndexScanNodeInfo {..}
+
+data LimitNodeInfo = LimitNodeInfo
+  { asyncCapable :: !Bool
+  }
+  deriving stock (Show)
+
+parseLimitNodeInfo :: Aeson.Object -> Aeson.Parser LimitNodeInfo
+parseLimitNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  pure LimitNodeInfo {..}
+
 data Node
-  = ResultNode !NodeInfo
+  = BitmapHeapScanNode !NodeInfo !BitmapHeapScanNodeInfo
+  | BitmapIndexScanNode !NodeInfo !BitmapIndexScanNodeInfo
+  | IndexOnlyScanNode !NodeInfo !IndexOnlyScanNodeInfo
+  | IndexScanNode !NodeInfo !IndexScanNodeInfo
+  | LimitNode !NodeInfo !LimitNodeInfo
+  | ResultNode !NodeInfo
   | SeqScanNode !NodeInfo !SeqScanNodeInfo
   | SortNode !NodeInfo !SortNodeInfo
   deriving stock (Show)
@@ -240,6 +481,21 @@ instance Aeson.FromJSON Node where
     Aeson.withObject "Node" \object -> do
       info <- parseNodeInfo object
       Aeson.parseField @Text object "Node Type" >>= \case
+        "Bitmap Heap Scan" -> do
+          bitmapHeapScanInfo <- parseBitmapHeapScanNodeInfo object
+          pure (BitmapHeapScanNode info bitmapHeapScanInfo)
+        "Bitmap Index Scan" -> do
+          bitmapIndexScanInfo <- parseBitmapIndexScanNodeInfo object
+          pure (BitmapIndexScanNode info bitmapIndexScanInfo)
+        "Index Only Scan" -> do
+          indexOnlyScanInfo <- parseIndexOnlyScanNodeInfo object
+          pure (IndexOnlyScanNode info indexOnlyScanInfo)
+        "Index Scan" -> do
+          indexScanInfo <- parseIndexScanNodeInfo object
+          pure (IndexScanNode info indexScanInfo)
+        "Limit" -> do
+          limitInfo <- parseLimitNodeInfo object
+          pure (LimitNode info limitInfo)
         "Result" -> pure (ResultNode info)
         "Seq Scan" -> do
           seqScanInfo <- parseSeqScanNodeInfo object
@@ -277,21 +533,25 @@ parseNodeInfo object = do
   parallelAware <- Aeson.parseField @Bool object "Parallel Aware"
   planRows <- Aeson.parseField @Int object "Plan Rows"
   planWidth <- Aeson.parseField @Int object "Plan Width"
-  plans <- Aeson.parseField @[Node] object "Plans" <|> pure []
+  plans <- fromMaybe [] <$> Aeson.parseFieldMaybe' @[Node] object "Plans"
   startupCost <- Aeson.parseField @Double object "Startup Cost"
   totalCost <- Aeson.parseField @Double object "Total Cost"
   pure NodeInfo {..}
 
 data SeqScanNodeInfo = SeqScanNodeInfo
   { alias :: !Text,
-    relationName :: !Text
+    filter :: !(Maybe Text),
+    relationName :: !Text,
+    rowsRemovedByFilter :: !(Maybe Int)
   }
   deriving stock (Show)
 
 parseSeqScanNodeInfo :: Aeson.Object -> Aeson.Parser SeqScanNodeInfo
 parseSeqScanNodeInfo object = do
   alias <- Aeson.parseField @Text object "Alias"
+  filter <- Aeson.parseFieldMaybe' @Text object "Filter"
   relationName <- Aeson.parseField @Text object "Relation Name"
+  rowsRemovedByFilter <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Filter"
   pure SeqScanNodeInfo {..}
 
 data SortNodeInfo = SortNodeInfo

@@ -11,13 +11,17 @@ executable pg
     directory == 1.3.8.3,
     optparse-applicative == 0.18.1.0,
     pretty-simple == 4.1.2.0,
+    prettyprinter == 1.7.1,
+    prettyprinter-ansi-terminal == 1.1.3,
     process == 1.6.18.0,
     text == 2.1.1,
     unix == 2.8.5.0,
   default-extensions:
     BlockArguments
     DerivingStrategies
+    DuplicateRecordFields
     LambdaCase
+    OverloadedRecordDot
     OverloadedStrings
     ViewPatterns
   default-language: GHC2021
