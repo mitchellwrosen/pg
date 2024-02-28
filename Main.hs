@@ -1,8 +1,12 @@
-module Main where
+{-# LANGUAGE RecordWildCards #-}
 
-import Control.Applicative (asum)
+module Main (main) where
+
+import Control.Applicative (asum, (<|>))
 import Control.Exception (bracket)
 import Control.Monad (when)
+import Data.Aeson qualified as Aeson
+import Data.Aeson.Types qualified as Aeson (Parser, parseField)
 import Data.ByteString qualified as ByteString
 import Data.Foldable (fold)
 import Data.Function ((&))
@@ -19,6 +23,7 @@ import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO qualified as IO
 import System.Posix qualified as Posix
 import System.Process qualified as Process
+import Text.Pretty.Simple (pPrint)
 import Text.Read (readMaybe)
 import Prelude hiding (lines, read)
 
@@ -35,12 +40,25 @@ main = do
             [ Opt.progDesc "Create a Postgres cluster."
             ]
             "create"
-            (pure pgClusterCreate),
+            (pure pgCreate),
           subcommand
             [ Opt.progDesc "Stop a Postgres cluster."
             ]
             "down"
-            (pure pgClusterDown),
+            (pure pgDown),
+          subcommand
+            [ Opt.progDesc "Run a query on a Postgres cluster."
+            ]
+            "exec"
+            (pgExec <$> textArg [Opt.metavar "QUERY"]),
+          subcommand
+            [ Opt.progDesc "Explain a query."
+            ]
+            "explain"
+            ( pgExplain
+                <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
+                <*> textArg [Opt.metavar "QUERY"]
+            ),
           subcommand
             [ Opt.progDesc "Load a Postgres database."
             ]
@@ -53,17 +71,17 @@ main = do
             [ Opt.progDesc "Connect to a Postgres cluster."
             ]
             "repl"
-            (pure pgClusterRepl),
+            (pure pgRepl),
           subcommand
             [ Opt.progDesc "Start a Postgres cluster."
             ]
             "up"
-            (pure pgClusterUp)
+            (pure pgUp)
         ]
     ]
 
-pgClusterCreate :: IO ()
-pgClusterCreate = do
+pgCreate :: IO ()
+pgCreate = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   Directory.doesDirectoryExist (Text.unpack clusterDir) >>= \case
@@ -82,8 +100,8 @@ pgClusterCreate = do
         Text.putStr err
         exitWith code
 
-pgClusterDown :: IO ()
-pgClusterDown = do
+pgDown :: IO ()
+pgDown = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   let postmasterFile = clusterDir <> "/postmaster.pid"
@@ -93,6 +111,51 @@ pgClusterDown = do
       (Text.lines <$> Text.readFile (Text.unpack postmasterFile)) >>= \case
         (readMaybe . Text.unpack -> Just pid) : _ -> Posix.signalProcess Posix.sigTERM pid
         _ -> Text.putStrLn ("Could not read PID from " <> postmasterFile)
+
+pgExec :: Text -> IO ()
+pgExec query = do
+  stateDir <- getStateDir
+  let clusterDir = stateDir <> "/data"
+  Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
+    False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
+    True -> do
+      (out, err, code) <-
+        process
+          "psql"
+          [ "--command=" <> query,
+            "--dbname=postgres",
+            "--host=" <> stateDir
+          ]
+      Text.putStr out
+      Text.putStr err
+      exitWith code
+
+pgExplain :: Maybe Text -> Text -> IO ()
+pgExplain maybeDatabase query = do
+  stateDir <- getStateDir
+  let clusterDir = stateDir <> "/data"
+  Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
+    False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
+    True -> do
+      (out, err, code) <-
+        process
+          "psql"
+          [ "--command=EXPLAIN (ANALYZE, FORMAT JSON) " <> query,
+            "--dbname=" <> fromMaybe "postgres" maybeDatabase,
+            "--host=" <> stateDir,
+            "--no-align",
+            "--tuples-only"
+          ]
+      if code == ExitSuccess
+        then do
+          Text.putStr out
+          case Aeson.eitherDecodeStrictText @[Analyze] out of
+            Left parseError -> Text.putStrLn (Text.pack parseError)
+            Right analyze -> pPrint (head analyze)
+        else do
+          Text.putStr out
+          Text.putStr err
+      exitWith code
 
 pgLoad :: Maybe Text -> Text -> IO ()
 pgLoad maybeDatabase file = do
@@ -109,8 +172,8 @@ pgLoad maybeDatabase file = do
     Text.putStr err
     exitWith code
 
-pgClusterRepl :: IO ()
-pgClusterRepl = do
+pgRepl :: IO ()
+pgRepl = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
@@ -124,8 +187,8 @@ pgClusterRepl = do
           ]
       exitWith code
 
-pgClusterUp :: IO ()
-pgClusterUp = do
+pgUp :: IO ()
+pgUp = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
@@ -145,6 +208,107 @@ pgClusterUp = do
         ]
         (stateDir <> "/log.txt")
     True -> Text.putStrLn ("There's already a cluster running at " <> clusterDir)
+
+------------------------------------------------------------------------------------------------------------------------
+-- EXPLAIN ANALYZE json utils
+
+data Analyze = Analyze
+  { executionTime :: !Double,
+    plan :: !Node,
+    planningTime :: !Double
+  }
+  deriving stock (Show)
+
+instance Aeson.FromJSON Analyze where
+  parseJSON :: Aeson.Value -> Aeson.Parser Analyze
+  parseJSON =
+    Aeson.withObject "Analyze" \object -> do
+      executionTime <- Aeson.parseField @Double object "Execution Time"
+      plan <- Aeson.parseField @Node object "Plan"
+      planningTime <- Aeson.parseField @Double object "Planning Time"
+      pure Analyze {..}
+
+data Node
+  = ResultNode !NodeInfo
+  | SeqScanNode !NodeInfo !SeqScanNodeInfo
+  | SortNode !NodeInfo !SortNodeInfo
+  deriving stock (Show)
+
+instance Aeson.FromJSON Node where
+  parseJSON :: Aeson.Value -> Aeson.Parser Node
+  parseJSON =
+    Aeson.withObject "Node" \object -> do
+      info <- parseNodeInfo object
+      Aeson.parseField @Text object "Node Type" >>= \case
+        "Result" -> pure (ResultNode info)
+        "Seq Scan" -> do
+          seqScanInfo <- parseSeqScanNodeInfo object
+          pure (SeqScanNode info seqScanInfo)
+        "Sort" -> do
+          sortInfo <- parseSortNodeInfo object
+          pure (SortNode info sortInfo)
+        typ -> fail ("Unknown node type: " ++ Text.unpack typ)
+
+data NodeInfo = NodeInfo
+  { actualLoops :: !Int,
+    actualRows :: !Int,
+    actualStartupTime :: !Double,
+    actualTotalTime :: !Double,
+    parallelAware :: !Bool,
+    planRows :: !Int,
+    planWidth :: !Int,
+    plans :: ![Node],
+    startupCost :: !Double,
+    totalCost :: !Double
+  }
+  deriving stock (Show)
+
+instance Aeson.FromJSON NodeInfo where
+  parseJSON :: Aeson.Value -> Aeson.Parser NodeInfo
+  parseJSON =
+    Aeson.withObject "NodeInfo" parseNodeInfo
+
+parseNodeInfo :: Aeson.Object -> Aeson.Parser NodeInfo
+parseNodeInfo object = do
+  actualLoops <- Aeson.parseField @Int object "Actual Loops"
+  actualRows <- Aeson.parseField @Int object "Actual Rows"
+  actualStartupTime <- Aeson.parseField @Double object "Actual Startup Time"
+  actualTotalTime <- Aeson.parseField @Double object "Actual Total Time"
+  parallelAware <- Aeson.parseField @Bool object "Parallel Aware"
+  planRows <- Aeson.parseField @Int object "Plan Rows"
+  planWidth <- Aeson.parseField @Int object "Plan Width"
+  plans <- Aeson.parseField @[Node] object "Plans" <|> pure []
+  startupCost <- Aeson.parseField @Double object "Startup Cost"
+  totalCost <- Aeson.parseField @Double object "Total Cost"
+  pure NodeInfo {..}
+
+data SeqScanNodeInfo = SeqScanNodeInfo
+  { alias :: !Text,
+    relationName :: !Text
+  }
+  deriving stock (Show)
+
+parseSeqScanNodeInfo :: Aeson.Object -> Aeson.Parser SeqScanNodeInfo
+parseSeqScanNodeInfo object = do
+  alias <- Aeson.parseField @Text object "Alias"
+  relationName <- Aeson.parseField @Text object "Relation Name"
+  pure SeqScanNodeInfo {..}
+
+data SortNodeInfo = SortNodeInfo
+  { sortKey :: ![Text],
+    sortMethod :: !Text,
+    sortSpaceType :: !Text,
+    sortSpaceUsed :: !Int
+  }
+  deriving stock (Show)
+
+parseSortNodeInfo :: Aeson.Object -> Aeson.Parser SortNodeInfo
+parseSortNodeInfo object = do
+  sortKey <- Aeson.parseField @[Text] object "Sort Key"
+  sortMethod <- Aeson.parseField @Text object "Sort Method"
+  sortSpaceType <- Aeson.parseField @Text object "Sort Space Type"
+  sortSpaceUsed <- Aeson.parseField @Int object "Sort Space Used"
+  pure SortNodeInfo {..}
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Cli utils

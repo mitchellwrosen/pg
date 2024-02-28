@@ -5,15 +5,18 @@ version: 0
 
 executable pg
   build-depends:
+    aeson == 2.2.1.0,
     base ^>= 4.18,
     bytestring == 0.11.5.2,
     directory == 1.3.8.3,
     optparse-applicative == 0.18.1.0,
+    pretty-simple == 4.1.2.0,
     process == 1.6.18.0,
     text == 2.1.1,
     unix == 2.8.5.0,
   default-extensions:
     BlockArguments
+    DerivingStrategies
     LambdaCase
     OverloadedStrings
     ViewPatterns
