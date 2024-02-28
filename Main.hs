@@ -7,10 +7,12 @@ import Data.ByteString qualified as ByteString
 import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Functor (void)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
+import Options.Applicative (optional)
 import Options.Applicative qualified as Opt
 import System.Directory qualified as Directory
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -39,6 +41,14 @@ main = do
             ]
             "down"
             (pure pgClusterDown),
+          subcommand
+            [ Opt.progDesc "Load a Postgres database."
+            ]
+            "load"
+            ( pgLoad
+                <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
+                <*> textArg [Opt.metavar "FILENAME"]
+            ),
           subcommand
             [ Opt.progDesc "Connect to a Postgres cluster."
             ]
@@ -71,7 +81,6 @@ pgClusterCreate = do
         Text.putStr out
         Text.putStr err
         exitWith code
-      Text.putStrLn ("Created a Postgres cluster at " <> clusterDir)
 
 pgClusterDown :: IO ()
 pgClusterDown = do
@@ -84,6 +93,23 @@ pgClusterDown = do
       (Text.lines <$> Text.readFile (Text.unpack postmasterFile)) >>= \case
         (readMaybe . Text.unpack -> Just pid) : _ -> Posix.signalProcess Posix.sigTERM pid
         _ -> Text.putStrLn ("Could not read PID from " <> postmasterFile)
+
+pgLoad :: Maybe Text -> Text -> IO ()
+pgLoad maybeDatabase file = do
+  stateDir <- getStateDir
+  (out, err, code) <-
+    process
+      "pg_restore"
+      [ "--dbname=" <> fromMaybe "postgres" maybeDatabase,
+        "--host=" <> stateDir,
+        "-U"
+        ,"postgres",
+        file
+      ]
+  when (code /= ExitSuccess) do
+    Text.putStr out
+    Text.putStr err
+    exitWith code
 
 pgClusterRepl :: IO ()
 pgClusterRepl = do
@@ -144,6 +170,10 @@ subcommand info name parser =
 textArg :: [Opt.Mod Opt.ArgumentFields Text] -> Opt.Parser Text
 textArg opts =
   Opt.strArgument (fold opts)
+
+textOpt :: [Opt.Mod Opt.OptionFields Text] -> Opt.Parser (Maybe Text)
+textOpt opts =
+  optional (Opt.strOption (fold opts))
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Subprocess utils
