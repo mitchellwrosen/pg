@@ -102,8 +102,6 @@ pgLoad maybeDatabase file = do
       "pg_restore"
       [ "--dbname=" <> fromMaybe "postgres" maybeDatabase,
         "--host=" <> stateDir,
-        "-U"
-        ,"postgres",
         file
       ]
   when (code /= ExitSuccess) do
