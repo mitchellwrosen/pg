@@ -4,7 +4,7 @@ module Main (main) where
 
 import Control.Applicative (asum)
 import Control.Exception (bracket)
-import Control.Monad (when)
+import Control.Monad (guard, when)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types qualified as Aeson (Parser, parseField, parseFieldMaybe')
 import Data.ByteString qualified as ByteString
@@ -12,7 +12,7 @@ import Data.Fixed (mod')
 import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Functor (void)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
@@ -30,6 +30,7 @@ import System.IO qualified as IO
 import System.Posix.ByteString qualified as Posix
 import System.Process qualified as Process
 import Text.Pretty.Simple (pPrint)
+import Text.Printf (printf)
 import Text.Read (readMaybe)
 import Prelude hiding (filter, lines, read)
 
@@ -162,17 +163,21 @@ pgExplain maybeDatabase query = do
               let bytesToDoc :: Int -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   bytesToDoc bytes =
                     Prettyprinter.pretty bytes <> " bytes"
+                  commaSepIntDoc :: Int -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  commaSepIntDoc =
+                    let loop acc d
+                          | d < 1000 = d : acc
+                          | otherwise = let (x, y) = divMod d 1000 in loop (y : acc) x
+                        pp [] = ""
+                        pp (n : ns) = Text.pack (show n) <> pps ns
+                        pps = Text.concat . map (("," <>) . pp1)
+                        pp1 = Text.pack . printf "%03d" :: Int -> Text
+                     in Prettyprinter.pretty . pp . loop []
                   costToDoc :: Double -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   costToDoc cost =
                     let dollars = floorDoubleInt cost
                         cents = roundDoubleInt (mod' cost 1 * 100)
-                        loop acc d
-                          | d < 1000 = d : acc
-                          | otherwise = let (x, y) = divMod d 1000 in loop (y : acc) x
-                        pp [] = ""
-                        pp [n] = Text.pack (show n)
-                        pp (n : ns) = Text.pack (show n) <> "," <> pp ns
-                     in Prettyprinter.pretty (pp (loop [] dollars))
+                     in commaSepIntDoc dollars
                           <> "."
                           <> (if cents < 10 then "0" else mempty)
                           <> Prettyprinter.pretty cents
@@ -191,83 +196,105 @@ pgExplain maybeDatabase query = do
                       s = ms / 1_000
                       double i =
                         Prettyprinter.pretty . Builder.toLazyText . Builder.formatRealFloat Builder.Fixed (Just i)
-                  nodeInfoToDoc :: NodeInfo -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
-                  nodeInfoToDoc info =
+                  nodeInfoToDoc :: Bool -> NodeInfo -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  nodeInfoToDoc showRows info =
                     -- how to show these?
                     -- actualLoops :: Int
                     -- parallelAware :: Bool
-                    Prettyprinter.vsep
-                      [ "Time: "
-                          <> timeToDoc (info.actualTotalTime * realToFrac @Int @Double info.actualLoops)
-                          <> " ("
-                          <> timeToDoc (info.actualStartupTime * realToFrac @Int @Double info.actualLoops)
-                          <> " to start, "
-                          <> timeToDoc ((info.actualTotalTime - info.actualStartupTime) * realToFrac @Int @Double info.actualLoops)
-                          <> " to execute)",
-                        "Cost: $" <> costToDoc info.totalCost <> " ($" <> costToDoc info.startupCost <> " to start, $" <> costToDoc (info.totalCost - info.startupCost) <> " to execute)",
-                        "Rows: "
-                          <> Prettyprinter.pretty (info.actualRows * info.actualLoops)
-                          <> " ("
-                          <> Prettyprinter.pretty (info.planRows * info.actualLoops)
-                          <> " predicted), "
-                          <> bytesToDoc info.planWidth
-                          <> " each"
+                    (Prettyprinter.vsep . catMaybes)
+                      [ Just $
+                          "Time: "
+                            <> timeToDoc (info.actualTotalTime * realToFrac @Int @Double info.actualLoops)
+                            <> " ("
+                            <> timeToDoc (info.actualStartupTime * realToFrac @Int @Double info.actualLoops)
+                            <> " to start, "
+                            <> timeToDoc ((info.actualTotalTime - info.actualStartupTime) * realToFrac @Int @Double info.actualLoops)
+                            <> " to execute)",
+                        Just $
+                          "Cost: $"
+                            <> costToDoc info.totalCost
+                            <> " ($"
+                            <> costToDoc info.startupCost
+                            <> " to start, $"
+                            <> costToDoc (info.totalCost - info.startupCost)
+                            <> " to execute)",
+                        do
+                          guard showRows
+                          Just $
+                            "Rows: "
+                              <> commaSepIntDoc (info.actualRows * info.actualLoops)
+                              <> " ("
+                              <> commaSepIntDoc (info.planRows * info.actualLoops)
+                              <> " predicted), "
+                              <> bytesToDoc info.planWidth
+                              <> " each"
                       ]
                   nodeToDoc :: Node -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   nodeToDoc = \case
                     BitmapHeapScanNode info bitmapHeapScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Bitmap heap scan " <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapHeapScanInfo.relationName))
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access bitmapped pages in table " <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapHeapScanInfo.relationName))
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc info
+                        <> "Condition: "
+                        <> Prettyprinter.pretty bitmapHeapScanInfo.recheckCond
+                        <> case bitmapHeapScanInfo.rowsRemovedByIndexRecheck of
+                          Nothing -> mempty
+                          Just rows -> " (removed " <> Prettyprinter.pretty rows <> if rows == 1 then " row)" else " rows)"
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     BitmapIndexScanNode info bitmapIndexScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Bitmap index scan using " <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapIndexScanInfo.indexName))
-                        <> ( case bitmapIndexScanInfo.indexCond of
-                               Nothing -> mempty
-                               Just cond -> ", " <> Prettyprinter.pretty cond
-                           )
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Access index "
+                            <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapIndexScanInfo.indexName)
+                            <> ", build bitmap of pages to visit"
+                        )
+                        <> case bitmapIndexScanInfo.indexCond of
+                          Nothing -> mempty
+                          Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc info
+                        <> nodeInfoToDoc True info
+                        <> nodesToDoc info.plans
+                    BitmapOrNode info _bitmapOrInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Bitwise-or the bitmaps"
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc False info
                         <> nodesToDoc info.plans
                     IndexOnlyScanNode info indexScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Scan index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName))
-                        <> ( case indexScanInfo.indexCond of
-                               Nothing -> mempty
-                               Just cond -> ", " <> Prettyprinter.pretty cond
-                           )
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName))
+                        <> case indexScanInfo.indexCond of
+                          Nothing -> mempty
+                          Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc info
+                        <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     IndexScanNode info indexScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Scan index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName) <> ", accessing table " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.relationName))
-                        <> ( case indexScanInfo.indexCond of
-                               Nothing -> mempty
-                               Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
-                           )
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName) <> ", access table " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.relationName))
+                        <> case indexScanInfo.indexCond of
+                          Nothing -> mempty
+                          Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc info
+                        <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     LimitNode info _limitInfo ->
                       Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Take the first " <> (if info.actualRows == 1 then "row" else Prettyprinter.pretty info.actualRows <> " rows"))
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc info
+                        <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     ResultNode info -> Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Result" <> nodesToDoc info.plans
                     SeqScanNode info seqScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Seq scan " <> Prettyprinter.dquotes (Prettyprinter.pretty seqScanInfo.relationName))
-                        <> ( case seqScanInfo.filter of
-                               Nothing -> mempty
-                               Just s -> ", filter " <> Prettyprinter.pretty s
-                           )
-                        <> ( case seqScanInfo.rowsRemovedByFilter of
-                               Nothing -> mempty
-                               Just rows ->
-                                 " (removed "
-                                   <> Prettyprinter.pretty rows
-                                   <> if rows == 1 then " row)" else " rows)"
-                           )
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access every page in table " <> Prettyprinter.dquotes (Prettyprinter.pretty seqScanInfo.relationName))
+                        <> case seqScanInfo.filter of
+                          Nothing -> mempty
+                          Just s -> Prettyprinter.line <> "Filter: " <> Prettyprinter.pretty s
+                        <> case seqScanInfo.rowsRemovedByFilter of
+                          Nothing -> mempty
+                          Just rows ->
+                            " (removed "
+                              <> Prettyprinter.pretty rows
+                              <> if rows == 1 then " row)" else " rows)"
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc info
+                        <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     SortNode info sortInfo ->
                       Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Sort on " <> Prettyprinter.pretty sortInfo.sortKey <> " using " <> Prettyprinter.pretty sortInfo.sortMethod)
@@ -408,6 +435,18 @@ parseBitmapIndexScanNodeInfo object = do
   parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
   pure BitmapIndexScanNodeInfo {..}
 
+data BitmapOrNodeInfo = BitmapOrNodeInfo
+  { asyncCapable :: !Bool,
+    parentRelationship :: !Text
+  }
+  deriving stock (Show)
+
+parseBitmapOrNodeInfo :: Aeson.Object -> Aeson.Parser BitmapOrNodeInfo
+parseBitmapOrNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
+  pure BitmapOrNodeInfo {..}
+
 data IndexOnlyScanNodeInfo = IndexOnlyScanNodeInfo
   { alias :: !Text,
     asyncCapable :: !Bool,
@@ -467,6 +506,7 @@ parseLimitNodeInfo object = do
 data Node
   = BitmapHeapScanNode !NodeInfo !BitmapHeapScanNodeInfo
   | BitmapIndexScanNode !NodeInfo !BitmapIndexScanNodeInfo
+  | BitmapOrNode !NodeInfo !BitmapOrNodeInfo
   | IndexOnlyScanNode !NodeInfo !IndexOnlyScanNodeInfo
   | IndexScanNode !NodeInfo !IndexScanNodeInfo
   | LimitNode !NodeInfo !LimitNodeInfo
@@ -487,6 +527,9 @@ instance Aeson.FromJSON Node where
         "Bitmap Index Scan" -> do
           bitmapIndexScanInfo <- parseBitmapIndexScanNodeInfo object
           pure (BitmapIndexScanNode info bitmapIndexScanInfo)
+        "BitmapOr" -> do
+          bitmapOrInfo <- parseBitmapOrNodeInfo object
+          pure (BitmapOrNode info bitmapOrInfo)
         "Index Only Scan" -> do
           indexOnlyScanInfo <- parseIndexOnlyScanNodeInfo object
           pure (IndexOnlyScanNode info indexOnlyScanInfo)
