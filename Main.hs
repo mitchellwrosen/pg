@@ -98,7 +98,7 @@ pgCreate = do
         process
           "initdb"
           [ "--encoding=UTF8",
-            "--locale=C.UTF-8",
+            "--locale=en_US.UTF-8",
             "--no-sync",
             "--pgdata=" <> clusterDir
           ]
@@ -138,12 +138,16 @@ pgExec query = do
       exitWith code
 
 pgExplain :: Maybe Text -> Text -> IO ()
-pgExplain maybeDatabase query = do
+pgExplain maybeDatabase queryOrFilename = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
     False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
     True -> do
+      query <-
+        Directory.doesFileExist (Text.unpack queryOrFilename) >>= \case
+          False -> pure queryOrFilename
+          True -> Text.readFile (Text.unpack queryOrFilename)
       (out, err, code) <-
         process
           "psql"
@@ -181,21 +185,33 @@ pgExplain maybeDatabase query = do
                           <> "."
                           <> (if cents < 10 then "0" else mempty)
                           <> Prettyprinter.pretty cents
+                  kbToDoc :: Int -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  kbToDoc kb
+                    | kb < 995 = Prettyprinter.pretty kb <> " kb"
+                    | kb < 9_950 = doubleToDoc 2 mb
+                    | kb < 99_500 = doubleToDoc 1 mb
+                    | kb < 995_000 = doubleToDoc 0 mb
+                    | kb < 9_950_000 = doubleToDoc 2 gb
+                    | kb < 99_500_000 = doubleToDoc 1 gb
+                    | otherwise = doubleToDoc 0 gb
+                    where
+                      mb = realToFrac @Int @Double kb / 1_000
+                      gb = realToFrac @Int @Double kb / 1_000_000
                   timeToDoc :: Double -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   timeToDoc ms
                     | us < 0.5 = "0 us"
-                    | us < 995 = double 0 us <> " µs"
-                    | us < 9_950 = double 2 ms <> " ms"
-                    | us < 99_500 = double 1 ms <> " ms"
-                    | ms < 995 = double 0 ms <> " ms"
-                    | ms < 9_950 = double 2 s <> " s"
-                    | ms < 99_500 = double 1 s <> " s"
-                    | otherwise = double 0 s <> " s"
+                    | us < 995 = doubleToDoc 0 us <> " µs"
+                    | us < 9_950 = doubleToDoc 2 ms <> " ms"
+                    | us < 99_500 = doubleToDoc 1 ms <> " ms"
+                    | ms < 995 = doubleToDoc 0 ms <> " ms"
+                    | ms < 9_950 = doubleToDoc 2 s <> " s"
+                    | ms < 99_500 = doubleToDoc 1 s <> " s"
+                    | otherwise = doubleToDoc 0 s <> " s"
                     where
                       us = ms * 1000
                       s = ms / 1_000
-                      double i =
-                        Prettyprinter.pretty . Builder.toLazyText . Builder.formatRealFloat Builder.Fixed (Just i)
+                  doubleToDoc i =
+                    Prettyprinter.pretty . Builder.toLazyText . Builder.formatRealFloat Builder.Fixed (Just i)
                   nodeInfoToDoc :: Bool -> NodeInfo -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   nodeInfoToDoc showRows info =
                     -- how to show these?
@@ -231,8 +247,39 @@ pgExplain maybeDatabase query = do
                       ]
                   nodeToDoc :: Node -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   nodeToDoc = \case
+                    AggregateNode info aggregateInfo ->
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Build a "
+                            <> ( case aggregateInfo.strategy of
+                                   "Hashed" -> "hash table"
+                                   _ -> "??? table"
+                               )
+                            <> " keyed by "
+                            <> Prettyprinter.hsep
+                              ( Prettyprinter.punctuate
+                                  Prettyprinter.comma
+                                  ( map
+                                      (Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized . Prettyprinter.pretty)
+                                      aggregateInfo.groupKey
+                                  )
+                              )
+                            <> ", then emit its values"
+                        )
+                        <> Prettyprinter.line
+                        <> "Peak memory usage: "
+                        <> kbToDoc aggregateInfo.peakMemoryUsage
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc True info
+                        <> nodesToDoc info.plans
                     BitmapHeapScanNode info bitmapHeapScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access bitmapped pages in table " <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapHeapScanInfo.relationName))
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Access bitmapped pages in table "
+                            <> Prettyprinter.annotate
+                              Prettyprinter.Render.Terminal.italicized
+                              (Prettyprinter.pretty bitmapHeapScanInfo.relationName)
+                        )
                         <> Prettyprinter.line
                         <> "Condition: "
                         <> Prettyprinter.pretty bitmapHeapScanInfo.recheckCond
@@ -246,7 +293,9 @@ pgExplain maybeDatabase query = do
                       Prettyprinter.annotate
                         Prettyprinter.Render.Terminal.bold
                         ( "Access index "
-                            <> Prettyprinter.dquotes (Prettyprinter.pretty bitmapIndexScanInfo.indexName)
+                            <> Prettyprinter.annotate
+                              Prettyprinter.Render.Terminal.italicized
+                              (Prettyprinter.pretty bitmapIndexScanInfo.indexName)
                             <> ", build bitmap of pages to visit"
                         )
                         <> case bitmapIndexScanInfo.indexCond of
@@ -258,10 +307,52 @@ pgExplain maybeDatabase query = do
                     BitmapOrNode info _bitmapOrInfo ->
                       Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Bitwise-or the bitmaps"
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc False info
+                        <> nodeInfoToDoc False info -- doesn't emit rows
+                        <> nodesToDoc info.plans
+                    FunctionScanNode info functionScanInfo ->
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Execute function "
+                            <> Prettyprinter.annotate
+                              Prettyprinter.Render.Terminal.italicized
+                              (Prettyprinter.pretty functionScanInfo.functionName)
+                        )
+                        <> case functionScanInfo.filter of
+                          Nothing -> mempty
+                          Just cond -> Prettyprinter.line <> "Filter: " <> Prettyprinter.pretty cond
+                        <> case functionScanInfo.rowsRemovedByFilter of
+                          Nothing -> mempty
+                          Just rows ->
+                            " (removed "
+                              <> Prettyprinter.pretty rows
+                              <> if rows == 1 then " row)" else " rows)"
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc True info
+                        <> nodesToDoc info.plans
+                    HashJoinNode info hashJoinInfo ->
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        (Prettyprinter.pretty hashJoinInfo.joinType <> " join (hash)")
+                        <> Prettyprinter.line
+                        <> "Condition: "
+                        <> Prettyprinter.pretty hashJoinInfo.hashCond
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc True info
+                        <> nodesToDoc info.plans
+                    HashNode info hashInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Build a hash table"
+                        <> Prettyprinter.line
+                        <> "Peak memory usage: "
+                        <> kbToDoc hashInfo.peakMemoryUsage
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc False info -- rows don't change from child
                         <> nodesToDoc info.plans
                     IndexOnlyScanNode info indexScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName))
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Access index "
+                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty indexScanInfo.indexName)
+                        )
                         <> case indexScanInfo.indexCond of
                           Nothing -> mempty
                           Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
@@ -269,7 +360,13 @@ pgExplain maybeDatabase query = do
                         <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     IndexScanNode info indexScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access index " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.indexName) <> ", access table " <> Prettyprinter.dquotes (Prettyprinter.pretty indexScanInfo.relationName))
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Access index "
+                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty indexScanInfo.indexName)
+                            <> ", access table "
+                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty indexScanInfo.relationName)
+                        )
                         <> case indexScanInfo.indexCond of
                           Nothing -> mempty
                           Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
@@ -279,11 +376,27 @@ pgExplain maybeDatabase query = do
                     LimitNode info _limitInfo ->
                       Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Take the first " <> (if info.actualRows == 1 then "row" else Prettyprinter.pretty info.actualRows <> " rows"))
                         <> Prettyprinter.line
+                        <> nodeInfoToDoc False info -- rows printed in first line
+                        <> nodesToDoc info.plans
+                    MemoizeNode info _memoizeInfo ->
+                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Memoize"
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc True info
+                        <> nodesToDoc info.plans
+                    NestedLoopNode info nestedLoopInfo ->
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        (Prettyprinter.pretty nestedLoopInfo.joinType <> " join (nested loop)")
+                        <> Prettyprinter.line
                         <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     ResultNode info -> Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Result" <> nodesToDoc info.plans
                     SeqScanNode info seqScanInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Access every page in table " <> Prettyprinter.dquotes (Prettyprinter.pretty seqScanInfo.relationName))
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Access every page in table "
+                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty seqScanInfo.relationName)
+                        )
                         <> case seqScanInfo.filter of
                           Nothing -> mempty
                           Just s -> Prettyprinter.line <> "Filter: " <> Prettyprinter.pretty s
@@ -297,7 +410,27 @@ pgExplain maybeDatabase query = do
                         <> nodeInfoToDoc True info
                         <> nodesToDoc info.plans
                     SortNode info sortInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Sort on " <> Prettyprinter.pretty sortInfo.sortKey <> " using " <> Prettyprinter.pretty sortInfo.sortMethod)
+                      Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( "Sort on "
+                            <> Prettyprinter.hsep
+                              ( Prettyprinter.punctuate
+                                  Prettyprinter.comma
+                                  ( map
+                                      (Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized . Prettyprinter.pretty)
+                                      sortInfo.sortKey
+                                  )
+                              )
+                            <> " using "
+                            <> Prettyprinter.pretty sortInfo.sortMethod
+                        )
+                        <> Prettyprinter.line
+                        <> case sortInfo.sortSpaceType of
+                          "Memory" -> "Memory: " <> kbToDoc sortInfo.sortSpaceUsed
+                          "Disk" -> "Disk: " <> kbToDoc sortInfo.sortSpaceUsed
+                          ty -> error ("Unknown sort type: " ++ Text.unpack ty)
+                        <> Prettyprinter.line
+                        <> nodeInfoToDoc False info -- rows don't change from child
                         <> nodesToDoc info.plans
                   nodesToDoc :: [Node] -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   nodesToDoc = \case
@@ -309,10 +442,13 @@ pgExplain maybeDatabase query = do
                   doc =
                     nodeToDoc analyze.plan
                       <> Prettyprinter.line
+                      <> "Total time: "
+                      <> timeToDoc (analyze.planningTime + analyze.executionTime)
+                      <> " ("
                       <> timeToDoc analyze.planningTime
                       <> " to plan, "
                       <> timeToDoc analyze.executionTime
-                      <> " to execute"
+                      <> " to execute)"
               doc
                 & Prettyprinter.layoutPretty (Prettyprinter.LayoutOptions Prettyprinter.Unbounded)
                 & Prettyprinter.Render.Terminal.renderStrict
@@ -381,6 +517,28 @@ pgUp = do
 ------------------------------------------------------------------------------------------------------------------------
 -- EXPLAIN ANALYZE json utils
 
+data AggregateNodeInfo = AggregateNodeInfo
+  { diskUsage :: !Int,
+    groupKey :: ![Text],
+    hashAggBatches :: !Int,
+    partialMode :: !Text,
+    peakMemoryUsage :: !Int,
+    plannedPartitions :: !Int,
+    strategy :: !Text
+  }
+  deriving stock (Show)
+
+parseAggregateNodeInfo :: Aeson.Object -> Aeson.Parser AggregateNodeInfo
+parseAggregateNodeInfo object = do
+  diskUsage <- Aeson.parseField @Int object "Disk Usage"
+  groupKey <- Aeson.parseField @[Text] object "Group Key"
+  hashAggBatches <- Aeson.parseField @Int object "HashAgg Batches"
+  partialMode <- Aeson.parseField @Text object "Partial Mode"
+  peakMemoryUsage <- Aeson.parseField @Int object "Peak Memory Usage"
+  plannedPartitions <- Aeson.parseField @Int object "Planned Partitions"
+  strategy <- Aeson.parseField @Text object "Strategy"
+  pure AggregateNodeInfo {..}
+
 data Analyze = Analyze
   { executionTime :: !Double,
     plan :: !Node,
@@ -402,6 +560,7 @@ data BitmapHeapScanNodeInfo = BitmapHeapScanNodeInfo
     asyncCapable :: !Bool,
     exactHeapBlocks :: !Int,
     lossyHeapBlocks :: !Int,
+    parentRelationship :: !(Maybe Text),
     recheckCond :: !Text,
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int)
@@ -414,6 +573,7 @@ parseBitmapHeapScanNodeInfo object = do
   asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   exactHeapBlocks <- Aeson.parseField @Int object "Exact Heap Blocks"
   lossyHeapBlocks <- Aeson.parseField @Int object "Lossy Heap Blocks"
+  parentRelationship <- Aeson.parseFieldMaybe' @Text object "Parent Relationship"
   recheckCond <- Aeson.parseField @Text object "Recheck Cond"
   relationName <- Aeson.parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
@@ -447,6 +607,60 @@ parseBitmapOrNodeInfo object = do
   parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
   pure BitmapOrNodeInfo {..}
 
+data FunctionScanNodeInfo = FunctionScanNodeInfo
+  { alias :: !Text,
+    filter :: !(Maybe Text),
+    functionName :: !Text,
+    rowsRemovedByFilter :: !(Maybe Int)
+  }
+  deriving stock (Show)
+
+parseFunctionScanNodeInfo :: Aeson.Object -> Aeson.Parser FunctionScanNodeInfo
+parseFunctionScanNodeInfo object = do
+  alias <- Aeson.parseField @Text object "Alias"
+  filter <- Aeson.parseFieldMaybe' @Text object "Filter"
+  functionName <- Aeson.parseField @Text object "Function Name"
+  rowsRemovedByFilter <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Filter"
+  pure FunctionScanNodeInfo {..}
+
+data HashJoinNodeInfo = HashJoinNodeInfo
+  { asyncCapable :: !Bool,
+    hashCond :: !Text,
+    innerUnique :: !Bool,
+    joinType :: !Text
+  }
+  deriving stock (Show)
+
+parseHashJoinNodeInfo :: Aeson.Object -> Aeson.Parser HashJoinNodeInfo
+parseHashJoinNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  hashCond <- Aeson.parseField @Text object "Hash Cond"
+  innerUnique <- Aeson.parseField @Bool object "Inner Unique"
+  joinType <- Aeson.parseField @Text object "Join Type"
+  pure HashJoinNodeInfo {..}
+
+data HashNodeInfo = HashNodeInfo
+  { asyncCapable :: !Bool,
+    hashBatches :: !Int,
+    hashBuckets :: !Int,
+    originalHashBatches :: !Int,
+    originalHashBuckets :: !Int,
+    parentRelationship :: !Text,
+    peakMemoryUsage :: !Int
+  }
+  deriving stock (Show)
+
+parseHashNodeInfo :: Aeson.Object -> Aeson.Parser HashNodeInfo
+parseHashNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  hashBatches <- Aeson.parseField @Int object "Hash Batches"
+  hashBuckets <- Aeson.parseField @Int object "Hash Buckets"
+  originalHashBatches <- Aeson.parseField @Int object "Original Hash Batches"
+  originalHashBuckets <- Aeson.parseField @Int object "Original Hash Buckets"
+  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
+  peakMemoryUsage <- Aeson.parseField @Int object "Peak Memory Usage"
+  pure HashNodeInfo {..}
+
 data IndexOnlyScanNodeInfo = IndexOnlyScanNodeInfo
   { alias :: !Text,
     asyncCapable :: !Bool,
@@ -476,9 +690,11 @@ data IndexScanNodeInfo = IndexScanNodeInfo
     asyncCapable :: !Bool,
     indexCond :: !(Maybe Text),
     indexName :: !Text,
+    parentRelationship :: !(Maybe Text),
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int),
-    scanDirection :: !Text
+    scanDirection :: !Text,
+    subplanName :: !(Maybe Text)
   }
   deriving stock (Show)
 
@@ -488,28 +704,76 @@ parseIndexScanNodeInfo object = do
   asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
   indexName <- Aeson.parseField @Text object "Index Name"
+  parentRelationship <- Aeson.parseFieldMaybe' @Text object "Parent Relationship"
   relationName <- Aeson.parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
   scanDirection <- Aeson.parseField @Text object "Scan Direction"
+  subplanName <- Aeson.parseFieldMaybe' @Text object "Subplan Name"
   pure IndexScanNodeInfo {..}
 
 data LimitNodeInfo = LimitNodeInfo
-  { asyncCapable :: !Bool
+  { asyncCapable :: !(Maybe Bool)
   }
   deriving stock (Show)
 
 parseLimitNodeInfo :: Aeson.Object -> Aeson.Parser LimitNodeInfo
 parseLimitNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  asyncCapable <- Aeson.parseFieldMaybe' @Bool object "Async Capable"
   pure LimitNodeInfo {..}
 
+data MemoizeNodeInfo = MemoizeNodeInfo
+  { asyncCapable :: !Bool,
+    cacheEvictions :: !Int,
+    cacheHits :: !Int,
+    cacheKey :: !Text,
+    cacheMisses :: !Int,
+    cacheMode :: !Text,
+    cacheOverflows :: !Int,
+    parentRelationship :: !Text,
+    peakMemoryUsage :: !Int
+  }
+  deriving stock (Show)
+
+parseMemoizeNodeInfo :: Aeson.Object -> Aeson.Parser MemoizeNodeInfo
+parseMemoizeNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  cacheEvictions <- Aeson.parseField @Int object "Cache Evictions"
+  cacheHits <- Aeson.parseField @Int object "Cache Hits"
+  cacheKey <- Aeson.parseField @Text object "Cache Key"
+  cacheMisses <- Aeson.parseField @Int object "Cache Misses"
+  cacheMode <- Aeson.parseField @Text object "Cache Mode"
+  cacheOverflows <- Aeson.parseField @Int object "Cache Overflows"
+  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
+  peakMemoryUsage <- Aeson.parseField @Int object "Peak Memory Usage"
+  pure MemoizeNodeInfo {..}
+
+data NestedLoopNodeInfo = NestedLoopNodeInfo
+  { asyncCapable :: !Bool,
+    innerUnique :: !Bool,
+    joinType :: !Text
+  }
+  deriving stock (Show)
+
+parseNestedLoopNodeInfo :: Aeson.Object -> Aeson.Parser NestedLoopNodeInfo
+parseNestedLoopNodeInfo object = do
+  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
+  innerUnique <- Aeson.parseField @Bool object "Inner Unique"
+  joinType <- Aeson.parseField @Text object "Join Type"
+  pure NestedLoopNodeInfo {..}
+
 data Node
-  = BitmapHeapScanNode !NodeInfo !BitmapHeapScanNodeInfo
+  = AggregateNode !NodeInfo !AggregateNodeInfo
+  | BitmapHeapScanNode !NodeInfo !BitmapHeapScanNodeInfo
   | BitmapIndexScanNode !NodeInfo !BitmapIndexScanNodeInfo
   | BitmapOrNode !NodeInfo !BitmapOrNodeInfo
+  | FunctionScanNode !NodeInfo !FunctionScanNodeInfo
+  | HashJoinNode !NodeInfo !HashJoinNodeInfo
+  | HashNode !NodeInfo !HashNodeInfo
   | IndexOnlyScanNode !NodeInfo !IndexOnlyScanNodeInfo
   | IndexScanNode !NodeInfo !IndexScanNodeInfo
   | LimitNode !NodeInfo !LimitNodeInfo
+  | MemoizeNode !NodeInfo !MemoizeNodeInfo
+  | NestedLoopNode !NodeInfo !NestedLoopNodeInfo
   | ResultNode !NodeInfo
   | SeqScanNode !NodeInfo !SeqScanNodeInfo
   | SortNode !NodeInfo !SortNodeInfo
@@ -521,6 +785,9 @@ instance Aeson.FromJSON Node where
     Aeson.withObject "Node" \object -> do
       info <- parseNodeInfo object
       Aeson.parseField @Text object "Node Type" >>= \case
+        "Aggregate" -> do
+          aggregateInfo <- parseAggregateNodeInfo object
+          pure (AggregateNode info aggregateInfo)
         "Bitmap Heap Scan" -> do
           bitmapHeapScanInfo <- parseBitmapHeapScanNodeInfo object
           pure (BitmapHeapScanNode info bitmapHeapScanInfo)
@@ -530,6 +797,15 @@ instance Aeson.FromJSON Node where
         "BitmapOr" -> do
           bitmapOrInfo <- parseBitmapOrNodeInfo object
           pure (BitmapOrNode info bitmapOrInfo)
+        "Function Scan" -> do
+          functionScanInfo <- parseFunctionScanNodeInfo object
+          pure (FunctionScanNode info functionScanInfo)
+        "Hash" -> do
+          hashInfo <- parseHashNodeInfo object
+          pure (HashNode info hashInfo)
+        "Hash Join" -> do
+          hashJoinInfo <- parseHashJoinNodeInfo object
+          pure (HashJoinNode info hashJoinInfo)
         "Index Only Scan" -> do
           indexOnlyScanInfo <- parseIndexOnlyScanNodeInfo object
           pure (IndexOnlyScanNode info indexOnlyScanInfo)
@@ -539,6 +815,12 @@ instance Aeson.FromJSON Node where
         "Limit" -> do
           limitInfo <- parseLimitNodeInfo object
           pure (LimitNode info limitInfo)
+        "Memoize" -> do
+          memoizeInfo <- parseMemoizeNodeInfo object
+          pure (MemoizeNode info memoizeInfo)
+        "Nested Loop" -> do
+          nestedLoopInfo <- parseNestedLoopNodeInfo object
+          pure (NestedLoopNode info nestedLoopInfo)
         "Result" -> pure (ResultNode info)
         "Seq Scan" -> do
           seqScanInfo <- parseSeqScanNodeInfo object
