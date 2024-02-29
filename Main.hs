@@ -4,7 +4,7 @@ module Main (main) where
 
 import Control.Applicative (asum)
 import Control.Exception (bracket)
-import Control.Monad (guard, when)
+import Control.Monad (when)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types qualified as Aeson (Parser, parseField, parseFieldMaybe')
 import Data.ByteString qualified as ByteString
@@ -12,7 +12,7 @@ import Data.Fixed (mod')
 import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Functor (void)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
@@ -166,7 +166,7 @@ pgExplain maybeDatabase queryOrFilename = do
               pPrint analyze
               let bytesToDoc :: Int -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   bytesToDoc bytes =
-                    Prettyprinter.pretty bytes <> " bytes"
+                    commaSepIntDoc bytes <> if bytes == 1 then " byte" else " bytes"
                   commaSepIntDoc :: Int -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   commaSepIntDoc =
                     let loop acc d
@@ -213,234 +213,384 @@ pgExplain maybeDatabase queryOrFilename = do
                   doubleToDoc i =
                     Prettyprinter.pretty . Builder.toLazyText . Builder.formatRealFloat Builder.Fixed (Just i)
                   nodeInfoToDoc :: Bool -> NodeInfo -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
-                  nodeInfoToDoc showRows info =
+                  nodeInfoToDoc evenOdd info =
                     -- how to show these?
-                    -- actualLoops :: Int
                     -- parallelAware :: Bool
-                    (Prettyprinter.vsep . catMaybes)
-                      [ Just $
-                          "Time: "
-                            <> timeToDoc (info.actualTotalTime * realToFrac @Int @Double info.actualLoops)
-                            <> " ("
-                            <> timeToDoc (info.actualStartupTime * realToFrac @Int @Double info.actualLoops)
-                            <> " to start, "
-                            <> timeToDoc ((info.actualTotalTime - info.actualStartupTime) * realToFrac @Int @Double info.actualLoops)
-                            <> " to execute)",
-                        Just $
-                          "Cost: $"
-                            <> costToDoc info.totalCost
-                            <> " ($"
-                            <> costToDoc info.startupCost
-                            <> " to start, $"
-                            <> costToDoc (info.totalCost - info.startupCost)
-                            <> " to execute)",
-                        do
-                          guard showRows
-                          Just $
-                            "Rows: "
-                              <> commaSepIntDoc (info.actualRows * info.actualLoops)
-                              <> " ("
-                              <> commaSepIntDoc (info.planRows * info.actualLoops)
-                              <> " predicted), "
-                              <> bytesToDoc info.planWidth
-                              <> " each"
+                    Prettyprinter.vsep
+                      [ let startup = info.actualStartupTime * realToFrac @Int @Double info.actualLoops
+                            total = info.actualTotalTime * realToFrac @Int @Double info.actualLoops
+                         in vbar evenOdd
+                              <> "∙ "
+                              <> timeToDoc startup
+                              <> (if startup == total then mempty else " → " <> timeToDoc total),
+                        vbar evenOdd
+                          <> "∙ $"
+                          <> costToDoc info.startupCost
+                          <> (if info.startupCost == info.totalCost then mempty else " → $" <> costToDoc info.totalCost)
                       ]
-                  nodeToDoc :: Node -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
-                  nodeToDoc = \case
+                  nodeToDoc :: Bool -> Node -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  nodeToDoc evenOdd = \case
                     AggregateNode info aggregateInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Build a "
-                            <> ( case aggregateInfo.strategy of
-                                   "Hashed" -> "hash table"
-                                   _ -> "??? table"
-                               )
-                            <> " keyed by "
-                            <> Prettyprinter.hsep
-                              ( Prettyprinter.punctuate
-                                  Prettyprinter.comma
-                                  ( map
-                                      (Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized . Prettyprinter.pretty)
-                                      aggregateInfo.groupKey
-                                  )
-                              )
-                            <> ", then emit its values"
-                        )
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( case aggregateInfo.strategy of
+                              AggregateStrategyHashed ->
+                                headerLine info
+                                  <> titleLine
+                                    evenOdd
+                                    info
+                                    ( "Build a hash table"
+                                        <> case aggregateInfo.groupKey of
+                                          Nothing -> mempty
+                                          Just key ->
+                                            " keyed by "
+                                              <> Prettyprinter.hsep
+                                                ( Prettyprinter.punctuate
+                                                    Prettyprinter.comma
+                                                    ( map
+                                                        ( Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized
+                                                            . Prettyprinter.pretty
+                                                        )
+                                                        key
+                                                    )
+                                                )
+                                        <> ", then emit its values"
+                                    )
+                              AggregateStrategyPlain -> "Reduce to a single value"
+                              AggregateStrategyMixed -> "Mixed aggregation" -- TODO make this better
+                              AggregateStrategySorted -> "Sorted aggregation" -- TODO make this better
+                          )
+                        <> case aggregateInfo.peakMemoryUsage of
+                          Nothing -> mempty
+                          Just mem -> vbar evenOdd <> "Peak memory usage: " <> kbToDoc mem <> Prettyprinter.line
+                        <> nodeInfoToDoc evenOdd info
                         <> Prettyprinter.line
-                        <> "Peak memory usage: "
-                        <> kbToDoc aggregateInfo.peakMemoryUsage
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
                     BitmapHeapScanNode info bitmapHeapScanInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Access bitmapped pages in table "
-                            <> Prettyprinter.annotate
-                              Prettyprinter.Render.Terminal.italicized
-                              (Prettyprinter.pretty bitmapHeapScanInfo.relationName)
-                        )
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ("Access bitmapped pages in table " <> annTable bitmapHeapScanInfo.relationName)
+                        <> filterLine (Just bitmapHeapScanInfo.recheckCond) bitmapHeapScanInfo.rowsRemovedByIndexRecheck
+                        <> nodeInfoToDoc evenOdd info
                         <> Prettyprinter.line
-                        <> "Condition: "
-                        <> Prettyprinter.pretty bitmapHeapScanInfo.recheckCond
-                        <> case bitmapHeapScanInfo.rowsRemovedByIndexRecheck of
-                          Nothing -> mempty
-                          Just rows -> " (removed " <> Prettyprinter.pretty rows <> if rows == 1 then " row)" else " rows)"
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
                     BitmapIndexScanNode info bitmapIndexScanInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Access index "
-                            <> Prettyprinter.annotate
-                              Prettyprinter.Render.Terminal.italicized
-                              (Prettyprinter.pretty bitmapIndexScanInfo.indexName)
-                            <> ", build bitmap of pages to visit"
-                        )
-                        <> case bitmapIndexScanInfo.indexCond of
-                          Nothing -> mempty
-                          Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( "Access "
+                              <> case bitmapIndexScanInfo.indexCond of
+                                Nothing -> "every page of index " <> annIndex bitmapIndexScanInfo.indexName
+                                Just cond -> "index " <> annIndex bitmapIndexScanInfo.indexName <> " at " <> annExpr cond
+                              <> ", build bitmap of pages to visit"
+                          )
+                        <> nodeInfoToDoc evenOdd info
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    BitmapOrNode info _bitmapOrInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Bitwise-or the bitmaps"
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    BitmapOrNode info ->
+                      headerLine info
+                        <> titleLine evenOdd info "Bitwise-or the bitmaps"
+                        <> nodeInfoToDoc evenOdd info
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc False info -- doesn't emit rows
-                        <> nodesToDoc info.plans
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
                     FunctionScanNode info functionScanInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Execute function "
-                            <> Prettyprinter.annotate
-                              Prettyprinter.Render.Terminal.italicized
-                              (Prettyprinter.pretty functionScanInfo.functionName)
-                        )
-                        <> case functionScanInfo.filter of
-                          Nothing -> mempty
-                          Just cond -> Prettyprinter.line <> "Filter: " <> Prettyprinter.pretty cond
-                        <> case functionScanInfo.rowsRemovedByFilter of
-                          Nothing -> mempty
-                          Just rows ->
-                            " (removed "
-                              <> Prettyprinter.pretty rows
-                              <> if rows == 1 then " row)" else " rows)"
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( "Execute function "
+                              <> Prettyprinter.annotate
+                                Prettyprinter.Render.Terminal.italicized
+                                (Prettyprinter.pretty functionScanInfo.functionName)
+                          )
+                        <> filterLine functionScanInfo.filter functionScanInfo.rowsRemovedByFilter
+                        <> nodeInfoToDoc evenOdd info
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    GatherNode info gatherInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( "Parallelize with "
+                              <> Prettyprinter.pretty gatherInfo.workersLaunched
+                              <> " additional threads"
+                              <> if gatherInfo.workersLaunched /= gatherInfo.workersPlanned
+                                then " (of " <> Prettyprinter.pretty gatherInfo.workersPlanned <> " requested)"
+                                else mempty
+                          )
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
                     HashJoinNode info hashJoinInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        (Prettyprinter.pretty hashJoinInfo.joinType <> " join (hash)")
-                        <> Prettyprinter.line
-                        <> "Condition: "
-                        <> Prettyprinter.pretty hashJoinInfo.hashCond
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    HashNode info hashInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Build a hash table"
-                        <> Prettyprinter.line
-                        <> "Peak memory usage: "
-                        <> kbToDoc hashInfo.peakMemoryUsage
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc False info -- rows don't change from child
-                        <> nodesToDoc info.plans
-                    IndexOnlyScanNode info indexScanInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Access index "
-                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty indexScanInfo.indexName)
-                        )
-                        <> case indexScanInfo.indexCond of
-                          Nothing -> mempty
-                          Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    IndexScanNode info indexScanInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Access index "
-                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty indexScanInfo.indexName)
-                            <> ", access table "
-                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty indexScanInfo.relationName)
-                        )
-                        <> case indexScanInfo.indexCond of
-                          Nothing -> mempty
-                          Just cond -> Prettyprinter.line <> "Condition: " <> Prettyprinter.pretty cond
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    LimitNode info _limitInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold ("Take the first " <> (if info.actualRows == 1 then "row" else Prettyprinter.pretty info.actualRows <> " rows"))
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc False info -- rows printed in first line
-                        <> nodesToDoc info.plans
-                    MemoizeNode info _memoizeInfo ->
-                      Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Memoize"
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    NestedLoopNode info nestedLoopInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        (Prettyprinter.pretty nestedLoopInfo.joinType <> " join (nested loop)")
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    ResultNode info -> Prettyprinter.annotate Prettyprinter.Render.Terminal.bold "Result" <> nodesToDoc info.plans
-                    SeqScanNode info seqScanInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Access every page in table "
-                            <> Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized (Prettyprinter.pretty seqScanInfo.relationName)
-                        )
-                        <> case seqScanInfo.filter of
-                          Nothing -> mempty
-                          Just s -> Prettyprinter.line <> "Filter: " <> Prettyprinter.pretty s
-                        <> case seqScanInfo.rowsRemovedByFilter of
-                          Nothing -> mempty
-                          Just rows ->
-                            " (removed "
-                              <> Prettyprinter.pretty rows
-                              <> if rows == 1 then " row)" else " rows)"
-                        <> Prettyprinter.line
-                        <> nodeInfoToDoc True info
-                        <> nodesToDoc info.plans
-                    SortNode info sortInfo ->
-                      Prettyprinter.annotate
-                        Prettyprinter.Render.Terminal.bold
-                        ( "Sort on "
-                            <> Prettyprinter.hsep
-                              ( Prettyprinter.punctuate
-                                  Prettyprinter.comma
-                                  ( map
-                                      (Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized . Prettyprinter.pretty)
-                                      sortInfo.sortKey
-                                  )
+                      let (outer, innerInfo, innerHashInfo) =
+                            case info.plans of
+                              [x, HashNode y z] -> (x, y, z)
+                              _ -> error "bogus hash join"
+                       in headerLine info
+                            <> titleLine
+                              evenOdd
+                              info
+                              ( Prettyprinter.pretty hashJoinInfo.joinType
+                                  <> " hash join"
+                                  <> (if hashJoinInfo.innerUnique then " (inner unique)" else mempty)
+                                  <> " on "
+                                  <> annExpr hashJoinInfo.hashCond
                               )
-                            <> " using "
-                            <> Prettyprinter.pretty sortInfo.sortMethod
-                        )
+                            <> nodeInfoToDoc evenOdd info
+                            <> Prettyprinter.line
+                            <> "╰─"
+                            <> Prettyprinter.nest
+                              2
+                              ( Prettyprinter.line
+                                  <> nodeToDoc (not evenOdd) outer
+                                  <> Prettyprinter.line
+                                  <> headerLine innerInfo
+                                  <> titleLine
+                                    (not evenOdd)
+                                    innerInfo
+                                    ( "Build a "
+                                        <> (if hashJoinInfo.innerUnique then "k→v" else "k→vs")
+                                        <> " hash table"
+                                    )
+                                  <> vbar (not evenOdd)
+                                  <> "Peak memory usage: "
+                                  <> kbToDoc innerHashInfo.peakMemoryUsage
+                                  <> Prettyprinter.line
+                                  <> nodeInfoToDoc (not evenOdd) innerInfo
+                                  <> Prettyprinter.line
+                                  <> "╰─"
+                                  <> nodesToDoc (not evenOdd) innerInfo.plans
+                              )
+                    HashNode {} -> error "unexpected HashNode"
+                    IndexOnlyScanNode info indexOnlyScanInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( "Access "
+                              <> case indexOnlyScanInfo.indexCond of
+                                Nothing -> "every page of index " <> annIndex indexOnlyScanInfo.indexName
+                                Just cond ->
+                                  "index "
+                                    <> annIndex indexOnlyScanInfo.indexName
+                                    <> " at "
+                                    <> annExpr cond
+                          )
+                        <> nodeInfoToDoc evenOdd info
                         <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    IndexScanNode info indexScanInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( "Access "
+                              <> case indexScanInfo.indexCond of
+                                Nothing -> "every page of index " <> annIndex indexScanInfo.indexName
+                                Just cond ->
+                                  "index "
+                                    <> annIndex indexScanInfo.indexName
+                                    <> " at "
+                                    <> annExpr cond
+                              <> ", for each row access table "
+                              <> annTable indexScanInfo.relationName
+                          )
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    LimitNode info ->
+                      headerLine info
+                        <> titleLine evenOdd info "Only emit a number of rows"
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    MaterializeNode info ->
+                      headerLine info
+                        <> titleLine evenOdd info "Materialize"
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    MemoizeNode info _memoizeInfo ->
+                      headerLine info
+                        <> titleLine evenOdd info "Memoize"
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    MergeJoinNode info mergeJoinInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( Prettyprinter.pretty mergeJoinInfo.joinType
+                              <> " merge join"
+                              <> (if mergeJoinInfo.innerUnique then " (inner unique)" else mempty)
+                              <> " on "
+                              <> annExpr mergeJoinInfo.mergeCond
+                          )
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    NestedLoopNode info nestedLoopInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( Prettyprinter.pretty nestedLoopInfo.joinType
+                              <> " nested loop join"
+                              <> if nestedLoopInfo.innerUnique then " (inner unique)" else mempty
+                          )
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    ResultNode info ->
+                      headerLine info
+                        <> titleLine evenOdd info "Result"
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    SeqScanNode info seqScanInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ("Access table " <> annTable seqScanInfo.relationName)
+                        <> filterLine seqScanInfo.filter seqScanInfo.rowsRemovedByFilter
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    SortNode info sortInfo ->
+                      headerLine info
+                        <> titleLine
+                          evenOdd
+                          info
+                          ( ( Prettyprinter.pretty @Text case sortInfo.sortMethod of
+                                "external merge" -> "On-disk mergesort on "
+                                "quicksort" -> "Quicksort on "
+                                "top-N heapsort" -> "Top-N heapsort on "
+                                method -> error ("Unknown sort method: " <> Text.unpack method)
+                            )
+                              <> Prettyprinter.hsep
+                                ( Prettyprinter.punctuate
+                                    Prettyprinter.comma
+                                    ( map
+                                        (Prettyprinter.annotate Prettyprinter.Render.Terminal.italicized . Prettyprinter.pretty)
+                                        sortInfo.sortKey
+                                    )
+                                )
+                          )
+                        <> vbar evenOdd
                         <> case sortInfo.sortSpaceType of
                           "Memory" -> "Memory: " <> kbToDoc sortInfo.sortSpaceUsed
                           "Disk" -> "Disk: " <> kbToDoc sortInfo.sortSpaceUsed
                           ty -> error ("Unknown sort type: " ++ Text.unpack ty)
                         <> Prettyprinter.line
-                        <> nodeInfoToDoc False info -- rows don't change from child
-                        <> nodesToDoc info.plans
-                  nodesToDoc :: [Node] -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
-                  nodesToDoc = \case
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    UniqueNode info ->
+                      headerLine info
+                        <> titleLine evenOdd info "Only emit distinct rows"
+                        <> nodeInfoToDoc evenOdd info
+                        <> Prettyprinter.line
+                        <> "╰─"
+                        <> nodesToDoc evenOdd info.plans
+                    where
+                      filterLine filter maybeRemoved =
+                        case (filter, maybeRemoved) of
+                          (Just cond, Just removed) ->
+                            vbar evenOdd
+                              <> "Filter: "
+                              <> annExpr cond
+                              <> " removed "
+                              <> commaSepIntDoc removed
+                              <> (if removed == 1 then " row" else " rows")
+                              <> Prettyprinter.line
+                          (Just cond, Nothing) ->
+                            vbar evenOdd
+                              <> "Filter: "
+                              <> annExpr cond
+                              <> Prettyprinter.line
+                          _ -> mempty
+
+                      headerLine info =
+                        "⮬ "
+                          <> commaSepIntDoc actualRows
+                          <> (if actualRows == 1 then " row" else " rows")
+                          <> ( if actualRows /= predictedRows
+                                 then " (" <> commaSepIntDoc predictedRows <> " predicted)"
+                                 else mempty
+                             )
+                          <> ", "
+                          <> bytesToDoc info.planWidth
+                          <> " each"
+                          <> Prettyprinter.line
+                          <> "╭─"
+                          <> Prettyprinter.line
+                        where
+                          actualRows = info.actualRows * info.actualLoops
+                          predictedRows = info.planRows * info.actualLoops
+
+                  nodesToDoc :: Bool -> [Node] -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  nodesToDoc evenOdd = \case
                     [] -> mempty
                     nodes ->
-                      Prettyprinter.line
-                        <> Prettyprinter.vsep (map ((\d -> "  ➤ " <> Prettyprinter.align d) . nodeToDoc) nodes)
+                      Prettyprinter.nest
+                        2
+                        (Prettyprinter.line <> Prettyprinter.vsep (map (nodeToDoc (not evenOdd)) nodes))
+
+                  titleLine evenOdd info title =
+                    vbar evenOdd
+                      <> Prettyprinter.annotate
+                        Prettyprinter.Render.Terminal.bold
+                        ( if info.actualLoops == 1
+                            then title
+                            else commaSepIntDoc info.actualLoops <> "x " <> title
+                        )
+                      <> Prettyprinter.line
+
+                  vbar evenOdd = if evenOdd then "┊" else "│"
+                  annExpr :: Text -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  annExpr =
+                    Prettyprinter.annotate (Prettyprinter.Render.Terminal.color Prettyprinter.Render.Terminal.Blue)
+                      . Prettyprinter.pretty
+                  annIndex :: Text -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  annIndex =
+                    Prettyprinter.annotate
+                      ( Prettyprinter.Render.Terminal.color Prettyprinter.Render.Terminal.Magenta
+                          <> Prettyprinter.Render.Terminal.italicized
+                      )
+                      . Prettyprinter.pretty
+                  annTable :: Text -> Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
+                  annTable =
+                    Prettyprinter.annotate
+                      ( Prettyprinter.Render.Terminal.color Prettyprinter.Render.Terminal.Red
+                          <> Prettyprinter.Render.Terminal.italicized
+                      )
+                      . Prettyprinter.pretty
+
               let doc :: Prettyprinter.Doc Prettyprinter.Render.Terminal.AnsiStyle
                   doc =
-                    nodeToDoc analyze.plan
+                    nodeToDoc False analyze.plan
                       <> Prettyprinter.line
                       <> "Total time: "
                       <> timeToDoc (analyze.planningTime + analyze.executionTime)
@@ -518,26 +668,42 @@ pgUp = do
 -- EXPLAIN ANALYZE json utils
 
 data AggregateNodeInfo = AggregateNodeInfo
-  { diskUsage :: !Int,
-    groupKey :: ![Text],
-    hashAggBatches :: !Int,
+  { diskUsage :: !(Maybe Int),
+    groupKey :: !(Maybe [Text]),
+    hashAggBatches :: !(Maybe Int),
     partialMode :: !Text,
-    peakMemoryUsage :: !Int,
-    plannedPartitions :: !Int,
-    strategy :: !Text
+    peakMemoryUsage :: !(Maybe Int),
+    plannedPartitions :: !(Maybe Int),
+    strategy :: !AggregateStrategy
   }
   deriving stock (Show)
 
 parseAggregateNodeInfo :: Aeson.Object -> Aeson.Parser AggregateNodeInfo
 parseAggregateNodeInfo object = do
-  diskUsage <- Aeson.parseField @Int object "Disk Usage"
-  groupKey <- Aeson.parseField @[Text] object "Group Key"
-  hashAggBatches <- Aeson.parseField @Int object "HashAgg Batches"
+  diskUsage <- Aeson.parseFieldMaybe' @Int object "Disk Usage"
+  groupKey <- Aeson.parseFieldMaybe' @[Text] object "Group Key"
+  hashAggBatches <- Aeson.parseFieldMaybe' @Int object "HashAgg Batches"
   partialMode <- Aeson.parseField @Text object "Partial Mode"
-  peakMemoryUsage <- Aeson.parseField @Int object "Peak Memory Usage"
-  plannedPartitions <- Aeson.parseField @Int object "Planned Partitions"
-  strategy <- Aeson.parseField @Text object "Strategy"
+  peakMemoryUsage <- Aeson.parseFieldMaybe' @Int object "Peak Memory Usage"
+  plannedPartitions <- Aeson.parseFieldMaybe' @Int object "Planned Partitions"
+  strategy <- Aeson.parseField @AggregateStrategy object "Strategy"
   pure AggregateNodeInfo {..}
+
+data AggregateStrategy
+  = AggregateStrategyHashed
+  | AggregateStrategyMixed
+  | AggregateStrategyPlain
+  | AggregateStrategySorted
+  deriving stock (Show)
+
+instance Aeson.FromJSON AggregateStrategy where
+  parseJSON =
+    Aeson.withText "AggregateStrategy" \case
+      "Hashed" -> pure AggregateStrategyHashed
+      "Mixed" -> pure AggregateStrategyMixed
+      "Plain" -> pure AggregateStrategyPlain
+      "Sorted" -> pure AggregateStrategySorted
+      strategy -> fail ("Unknown aggregate strategy: " ++ Text.unpack strategy)
 
 data Analyze = Analyze
   { executionTime :: !Double,
@@ -557,10 +723,8 @@ instance Aeson.FromJSON Analyze where
 
 data BitmapHeapScanNodeInfo = BitmapHeapScanNodeInfo
   { alias :: !Text,
-    asyncCapable :: !Bool,
     exactHeapBlocks :: !Int,
     lossyHeapBlocks :: !Int,
-    parentRelationship :: !(Maybe Text),
     recheckCond :: !Text,
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int)
@@ -570,42 +734,24 @@ data BitmapHeapScanNodeInfo = BitmapHeapScanNodeInfo
 parseBitmapHeapScanNodeInfo :: Aeson.Object -> Aeson.Parser BitmapHeapScanNodeInfo
 parseBitmapHeapScanNodeInfo object = do
   alias <- Aeson.parseField @Text object "Alias"
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   exactHeapBlocks <- Aeson.parseField @Int object "Exact Heap Blocks"
   lossyHeapBlocks <- Aeson.parseField @Int object "Lossy Heap Blocks"
-  parentRelationship <- Aeson.parseFieldMaybe' @Text object "Parent Relationship"
   recheckCond <- Aeson.parseField @Text object "Recheck Cond"
   relationName <- Aeson.parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
   pure BitmapHeapScanNodeInfo {..}
 
 data BitmapIndexScanNodeInfo = BitmapIndexScanNodeInfo
-  { asyncCapable :: !Bool,
-    indexCond :: !(Maybe Text),
-    indexName :: !Text,
-    parentRelationship :: !Text
+  { indexCond :: !(Maybe Text),
+    indexName :: !Text
   }
   deriving stock (Show)
 
 parseBitmapIndexScanNodeInfo :: Aeson.Object -> Aeson.Parser BitmapIndexScanNodeInfo
 parseBitmapIndexScanNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
   indexName <- Aeson.parseField @Text object "Index Name"
-  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
   pure BitmapIndexScanNodeInfo {..}
-
-data BitmapOrNodeInfo = BitmapOrNodeInfo
-  { asyncCapable :: !Bool,
-    parentRelationship :: !Text
-  }
-  deriving stock (Show)
-
-parseBitmapOrNodeInfo :: Aeson.Object -> Aeson.Parser BitmapOrNodeInfo
-parseBitmapOrNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
-  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
-  pure BitmapOrNodeInfo {..}
 
 data FunctionScanNodeInfo = FunctionScanNodeInfo
   { alias :: !Text,
@@ -623,9 +769,22 @@ parseFunctionScanNodeInfo object = do
   rowsRemovedByFilter <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Filter"
   pure FunctionScanNodeInfo {..}
 
+data GatherNodeInfo = GatherNodeInfo
+  { singleCopy :: !Bool,
+    workersLaunched :: !Int,
+    workersPlanned :: !Int
+  }
+  deriving stock (Show)
+
+parseGatherNodeInfo :: Aeson.Object -> Aeson.Parser GatherNodeInfo
+parseGatherNodeInfo object = do
+  singleCopy <- Aeson.parseField @Bool object "Single Copy"
+  workersLaunched <- Aeson.parseField @Int object "Workers Launched"
+  workersPlanned <- Aeson.parseField @Int object "Workers Planned"
+  pure GatherNodeInfo {..}
+
 data HashJoinNodeInfo = HashJoinNodeInfo
-  { asyncCapable :: !Bool,
-    hashCond :: !Text,
+  { hashCond :: !Text,
     innerUnique :: !Bool,
     joinType :: !Text
   }
@@ -633,37 +792,31 @@ data HashJoinNodeInfo = HashJoinNodeInfo
 
 parseHashJoinNodeInfo :: Aeson.Object -> Aeson.Parser HashJoinNodeInfo
 parseHashJoinNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   hashCond <- Aeson.parseField @Text object "Hash Cond"
   innerUnique <- Aeson.parseField @Bool object "Inner Unique"
   joinType <- Aeson.parseField @Text object "Join Type"
   pure HashJoinNodeInfo {..}
 
 data HashNodeInfo = HashNodeInfo
-  { asyncCapable :: !Bool,
-    hashBatches :: !Int,
+  { hashBatches :: !Int,
     hashBuckets :: !Int,
     originalHashBatches :: !Int,
     originalHashBuckets :: !Int,
-    parentRelationship :: !Text,
     peakMemoryUsage :: !Int
   }
   deriving stock (Show)
 
 parseHashNodeInfo :: Aeson.Object -> Aeson.Parser HashNodeInfo
 parseHashNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   hashBatches <- Aeson.parseField @Int object "Hash Batches"
   hashBuckets <- Aeson.parseField @Int object "Hash Buckets"
   originalHashBatches <- Aeson.parseField @Int object "Original Hash Batches"
   originalHashBuckets <- Aeson.parseField @Int object "Original Hash Buckets"
-  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
   peakMemoryUsage <- Aeson.parseField @Int object "Peak Memory Usage"
   pure HashNodeInfo {..}
 
 data IndexOnlyScanNodeInfo = IndexOnlyScanNodeInfo
   { alias :: !Text,
-    asyncCapable :: !Bool,
     heapFetches :: !Int,
     indexCond :: !(Maybe Text),
     indexName :: !Text,
@@ -676,7 +829,6 @@ data IndexOnlyScanNodeInfo = IndexOnlyScanNodeInfo
 parseIndexOnlyScanNodeInfo :: Aeson.Object -> Aeson.Parser IndexOnlyScanNodeInfo
 parseIndexOnlyScanNodeInfo object = do
   alias <- Aeson.parseField @Text object "Alias"
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   heapFetches <- Aeson.parseField @Int object "Heap Fetches"
   indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
   indexName <- Aeson.parseField @Text object "Index Name"
@@ -687,10 +839,8 @@ parseIndexOnlyScanNodeInfo object = do
 
 data IndexScanNodeInfo = IndexScanNodeInfo
   { alias :: !Text,
-    asyncCapable :: !Bool,
     indexCond :: !(Maybe Text),
     indexName :: !Text,
-    parentRelationship :: !(Maybe Text),
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int),
     scanDirection :: !Text,
@@ -701,62 +851,58 @@ data IndexScanNodeInfo = IndexScanNodeInfo
 parseIndexScanNodeInfo :: Aeson.Object -> Aeson.Parser IndexScanNodeInfo
 parseIndexScanNodeInfo object = do
   alias <- Aeson.parseField @Text object "Alias"
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   indexCond <- Aeson.parseFieldMaybe' @Text object "Index Cond"
   indexName <- Aeson.parseField @Text object "Index Name"
-  parentRelationship <- Aeson.parseFieldMaybe' @Text object "Parent Relationship"
   relationName <- Aeson.parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- Aeson.parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
   scanDirection <- Aeson.parseField @Text object "Scan Direction"
   subplanName <- Aeson.parseFieldMaybe' @Text object "Subplan Name"
   pure IndexScanNodeInfo {..}
 
-data LimitNodeInfo = LimitNodeInfo
-  { asyncCapable :: !(Maybe Bool)
-  }
-  deriving stock (Show)
-
-parseLimitNodeInfo :: Aeson.Object -> Aeson.Parser LimitNodeInfo
-parseLimitNodeInfo object = do
-  asyncCapable <- Aeson.parseFieldMaybe' @Bool object "Async Capable"
-  pure LimitNodeInfo {..}
-
 data MemoizeNodeInfo = MemoizeNodeInfo
-  { asyncCapable :: !Bool,
-    cacheEvictions :: !Int,
+  { cacheEvictions :: !Int,
     cacheHits :: !Int,
     cacheKey :: !Text,
     cacheMisses :: !Int,
     cacheMode :: !Text,
     cacheOverflows :: !Int,
-    parentRelationship :: !Text,
     peakMemoryUsage :: !Int
   }
   deriving stock (Show)
 
 parseMemoizeNodeInfo :: Aeson.Object -> Aeson.Parser MemoizeNodeInfo
 parseMemoizeNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   cacheEvictions <- Aeson.parseField @Int object "Cache Evictions"
   cacheHits <- Aeson.parseField @Int object "Cache Hits"
   cacheKey <- Aeson.parseField @Text object "Cache Key"
   cacheMisses <- Aeson.parseField @Int object "Cache Misses"
   cacheMode <- Aeson.parseField @Text object "Cache Mode"
   cacheOverflows <- Aeson.parseField @Int object "Cache Overflows"
-  parentRelationship <- Aeson.parseField @Text object "Parent Relationship"
   peakMemoryUsage <- Aeson.parseField @Int object "Peak Memory Usage"
   pure MemoizeNodeInfo {..}
 
+data MergeJoinNodeInfo = MergeJoinNodeInfo
+  { innerUnique :: !Bool,
+    joinType :: !Text,
+    mergeCond :: !Text
+  }
+  deriving stock (Show)
+
+parseMergeJoinNodeInfo :: Aeson.Object -> Aeson.Parser MergeJoinNodeInfo
+parseMergeJoinNodeInfo object = do
+  innerUnique <- Aeson.parseField @Bool object "Inner Unique"
+  joinType <- Aeson.parseField @Text object "Join Type"
+  mergeCond <- Aeson.parseField @Text object "Merge Cond"
+  pure MergeJoinNodeInfo {..}
+
 data NestedLoopNodeInfo = NestedLoopNodeInfo
-  { asyncCapable :: !Bool,
-    innerUnique :: !Bool,
+  { innerUnique :: !Bool,
     joinType :: !Text
   }
   deriving stock (Show)
 
 parseNestedLoopNodeInfo :: Aeson.Object -> Aeson.Parser NestedLoopNodeInfo
 parseNestedLoopNodeInfo object = do
-  asyncCapable <- Aeson.parseField @Bool object "Async Capable"
   innerUnique <- Aeson.parseField @Bool object "Inner Unique"
   joinType <- Aeson.parseField @Text object "Join Type"
   pure NestedLoopNodeInfo {..}
@@ -765,18 +911,22 @@ data Node
   = AggregateNode !NodeInfo !AggregateNodeInfo
   | BitmapHeapScanNode !NodeInfo !BitmapHeapScanNodeInfo
   | BitmapIndexScanNode !NodeInfo !BitmapIndexScanNodeInfo
-  | BitmapOrNode !NodeInfo !BitmapOrNodeInfo
+  | BitmapOrNode !NodeInfo
   | FunctionScanNode !NodeInfo !FunctionScanNodeInfo
+  | GatherNode !NodeInfo !GatherNodeInfo
   | HashJoinNode !NodeInfo !HashJoinNodeInfo
   | HashNode !NodeInfo !HashNodeInfo
   | IndexOnlyScanNode !NodeInfo !IndexOnlyScanNodeInfo
   | IndexScanNode !NodeInfo !IndexScanNodeInfo
-  | LimitNode !NodeInfo !LimitNodeInfo
+  | LimitNode !NodeInfo
+  | MaterializeNode !NodeInfo
   | MemoizeNode !NodeInfo !MemoizeNodeInfo
+  | MergeJoinNode !NodeInfo !MergeJoinNodeInfo
   | NestedLoopNode !NodeInfo !NestedLoopNodeInfo
   | ResultNode !NodeInfo
   | SeqScanNode !NodeInfo !SeqScanNodeInfo
   | SortNode !NodeInfo !SortNodeInfo
+  | UniqueNode !NodeInfo
   deriving stock (Show)
 
 instance Aeson.FromJSON Node where
@@ -784,58 +934,40 @@ instance Aeson.FromJSON Node where
   parseJSON =
     Aeson.withObject "Node" \object -> do
       info <- parseNodeInfo object
+      let go constructor parse = do
+            info2 <- parse object
+            pure (constructor info info2)
       Aeson.parseField @Text object "Node Type" >>= \case
-        "Aggregate" -> do
-          aggregateInfo <- parseAggregateNodeInfo object
-          pure (AggregateNode info aggregateInfo)
-        "Bitmap Heap Scan" -> do
-          bitmapHeapScanInfo <- parseBitmapHeapScanNodeInfo object
-          pure (BitmapHeapScanNode info bitmapHeapScanInfo)
-        "Bitmap Index Scan" -> do
-          bitmapIndexScanInfo <- parseBitmapIndexScanNodeInfo object
-          pure (BitmapIndexScanNode info bitmapIndexScanInfo)
-        "BitmapOr" -> do
-          bitmapOrInfo <- parseBitmapOrNodeInfo object
-          pure (BitmapOrNode info bitmapOrInfo)
-        "Function Scan" -> do
-          functionScanInfo <- parseFunctionScanNodeInfo object
-          pure (FunctionScanNode info functionScanInfo)
-        "Hash" -> do
-          hashInfo <- parseHashNodeInfo object
-          pure (HashNode info hashInfo)
-        "Hash Join" -> do
-          hashJoinInfo <- parseHashJoinNodeInfo object
-          pure (HashJoinNode info hashJoinInfo)
-        "Index Only Scan" -> do
-          indexOnlyScanInfo <- parseIndexOnlyScanNodeInfo object
-          pure (IndexOnlyScanNode info indexOnlyScanInfo)
-        "Index Scan" -> do
-          indexScanInfo <- parseIndexScanNodeInfo object
-          pure (IndexScanNode info indexScanInfo)
-        "Limit" -> do
-          limitInfo <- parseLimitNodeInfo object
-          pure (LimitNode info limitInfo)
-        "Memoize" -> do
-          memoizeInfo <- parseMemoizeNodeInfo object
-          pure (MemoizeNode info memoizeInfo)
-        "Nested Loop" -> do
-          nestedLoopInfo <- parseNestedLoopNodeInfo object
-          pure (NestedLoopNode info nestedLoopInfo)
+        "Aggregate" -> go AggregateNode parseAggregateNodeInfo
+        "Bitmap Heap Scan" -> go BitmapHeapScanNode parseBitmapHeapScanNodeInfo
+        "Bitmap Index Scan" -> go BitmapIndexScanNode parseBitmapIndexScanNodeInfo
+        "BitmapOr" -> pure (BitmapOrNode info)
+        "Function Scan" -> go FunctionScanNode parseFunctionScanNodeInfo
+        "Gather" -> go GatherNode parseGatherNodeInfo
+        "Hash" -> go HashNode parseHashNodeInfo
+        "Hash Join" -> go HashJoinNode parseHashJoinNodeInfo
+        "Index Only Scan" -> go IndexOnlyScanNode parseIndexOnlyScanNodeInfo
+        "Index Scan" -> go IndexScanNode parseIndexScanNodeInfo
+        "Limit" -> pure (LimitNode info)
+        "Materialize" -> pure (MaterializeNode info)
+        "Memoize" -> go MemoizeNode parseMemoizeNodeInfo
+        "Merge Join" -> go MergeJoinNode parseMergeJoinNodeInfo
+        "Nested Loop" -> go NestedLoopNode parseNestedLoopNodeInfo
         "Result" -> pure (ResultNode info)
-        "Seq Scan" -> do
-          seqScanInfo <- parseSeqScanNodeInfo object
-          pure (SeqScanNode info seqScanInfo)
-        "Sort" -> do
-          sortInfo <- parseSortNodeInfo object
-          pure (SortNode info sortInfo)
+        "Seq Scan" -> go SeqScanNode parseSeqScanNodeInfo
+        "Sort" -> go SortNode parseSortNodeInfo
+        "Unique" -> pure (UniqueNode info)
         typ -> fail ("Unknown node type: " ++ Text.unpack typ)
+    where
 
 data NodeInfo = NodeInfo
   { actualLoops :: !Int,
     actualRows :: !Int,
     actualStartupTime :: !Double,
     actualTotalTime :: !Double,
+    asyncCapable :: !(Maybe Bool),
     parallelAware :: !Bool,
+    parentRelationship :: !(Maybe Text),
     planRows :: !Int,
     planWidth :: !Int,
     plans :: ![Node],
@@ -855,7 +987,9 @@ parseNodeInfo object = do
   actualRows <- Aeson.parseField @Int object "Actual Rows"
   actualStartupTime <- Aeson.parseField @Double object "Actual Startup Time"
   actualTotalTime <- Aeson.parseField @Double object "Actual Total Time"
+  asyncCapable <- Aeson.parseFieldMaybe' @Bool object "Async Capable"
   parallelAware <- Aeson.parseField @Bool object "Parallel Aware"
+  parentRelationship <- Aeson.parseFieldMaybe' @Text object "Parent Relationship"
   planRows <- Aeson.parseField @Int object "Plan Rows"
   planWidth <- Aeson.parseField @Int object "Plan Width"
   plans <- fromMaybe [] <$> Aeson.parseFieldMaybe' @[Node] object "Plans"
