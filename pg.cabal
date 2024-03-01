@@ -27,3 +27,7 @@ executable pg
   default-language: GHC2021
   ghc-options: -Wall -threaded "-with-rtsopts=-A64m -N2"
   main-is: Main.hs
+  other-modules:
+    PgPlan
+    PgPlanJson
+    PgPlanPretty
