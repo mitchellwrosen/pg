@@ -25,7 +25,6 @@ import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO qualified as IO
 import System.Posix.ByteString qualified as Posix
 import System.Process qualified as Process
-import Text.Pretty.Simple (pPrint)
 import Text.Read (readMaybe)
 import Prelude hiding (filter, lines, read)
 
@@ -146,7 +145,7 @@ pgExplain maybeDatabase queryOrFilename = do
       (out, err, code) <-
         process
           "psql"
-          [ "--command=EXPLAIN (ANALYZE, FORMAT JSON) " <> query,
+          [ "--command=EXPLAIN (ANALYZE ON, FORMAT JSON) " <> query,
             "--dbname=" <> fromMaybe "postgres" maybeDatabase,
             "--host=" <> stateDir,
             "--no-align",
@@ -154,11 +153,11 @@ pgExplain maybeDatabase queryOrFilename = do
           ]
       if code == ExitSuccess
         then do
-          Text.putStr out
+          Text.putStrLn out
+          Text.putStrLn query
           case Aeson.eitherDecodeStrictText @[Analyze] out of
             Left parseError -> Text.putStrLn (Text.pack parseError)
-            Right (head -> analyze) -> do
-              pPrint analyze
+            Right (head -> analyze) ->
               analyze
                 & prettyAnalyze
                 & Prettyprinter.layoutPretty (Prettyprinter.LayoutOptions Prettyprinter.Unbounded)

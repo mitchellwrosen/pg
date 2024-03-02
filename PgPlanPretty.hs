@@ -17,54 +17,66 @@ import Text.Printf (printf)
 import Prelude hiding (filter)
 
 data Vnode = Vnode
-  { actualRows :: !Int,
+  { actualRowsPerLoop :: !Int,
     children :: [Vnode],
     loops :: !Int,
     metadata :: ![Doc AnsiStyle],
-    predictedRows :: !Int,
+    name :: !(Maybe Text),
+    predictedRowsPerLoop :: !Int,
+    relationship :: !(Maybe Text),
     rowBytes :: !Int,
     startupCost :: !Double,
-    startupTime :: !Double,
+    startupTimePerLoop :: !Double,
     summary :: !(Doc AnsiStyle),
     totalCost :: !Double,
-    totalTime :: !Double
+    totalTimePerLoop :: !Double
   }
 
 makeVnode :: NodeInfo -> Vnode
 makeVnode info =
   Vnode
-    { actualRows = info.actualRows * info.actualLoops,
+    { actualRowsPerLoop = info.actualRows,
       children = map nodeVnode info.plans,
       loops = info.actualLoops,
       metadata = [],
-      predictedRows = info.planRows * info.actualLoops,
+      name =
+        case info.parentRelationship of
+          Just "SubPlan" -> Just "Correlated subquery, run once for every row emitted by parent"
+          _ -> info.subplanName,
+      predictedRowsPerLoop = info.planRows,
+      relationship = info.parentRelationship,
       rowBytes = info.planWidth,
       startupCost = info.startupCost,
-      startupTime = info.actualStartupTime * realToFrac @Int @Double info.actualLoops,
+      startupTimePerLoop = info.actualStartupTime,
       summary = mempty,
       totalCost = info.totalCost,
-      totalTime = info.actualTotalTime * realToFrac @Int @Double info.actualLoops
+      totalTimePerLoop = info.actualTotalTime
     }
 
 prettyVnode :: Bool -> Vnode -> Doc AnsiStyle
 prettyVnode indentAfterRows node =
   fold
-    [ "⮬ ",
+    [ case node.relationship of
+        Just "InitPlan" -> "● "
+        _ -> "⮬ ",
       annRows
-        ( prettyInt node.actualRows
-            <> (if node.actualRows == 1 then " row" else " rows")
-            <> ( if node.actualRows /= node.predictedRows
-                   then " (" <> prettyInt node.predictedRows <> " predicted)"
+        ( prettyInt actualRows
+            <> (if actualRows == 1 then " row" else " rows")
+            <> ( if actualRows /= predictedRows
+                   then " (" <> prettyInt predictedRows <> " predicted)"
                    else mempty
                )
         ),
       ", ",
-      annBytes (prettyBytes node.rowBytes <> (if node.actualRows == 1 then mempty else " each")),
+      annBytes (prettyBytes node.rowBytes <> (if actualRows == 1 then mempty else " each")),
       (if indentAfterRows then nest 4 else id) $
         fold
           [ line,
             "╭─",
             line,
+            case node.name of
+              Nothing -> mempty
+              Just s -> vbar <> annotate (color Black) ("# " <> pretty s) <> line,
             vbar,
             annotate
               bold
@@ -78,8 +90,8 @@ prettyVnode indentAfterRows node =
             vbar,
             annotate
               (colorDull Yellow)
-              ( prettyMilliseconds node.startupTime
-                  <> (if node.startupTime == node.totalTime then mempty else " → " <> prettyMilliseconds node.totalTime)
+              ( prettyMilliseconds startupTime
+                  <> (if startupTime == totalTime then mempty else " → " <> prettyMilliseconds totalTime)
               ),
             annotate (color Black) " │ ",
             annotate
@@ -96,6 +108,11 @@ prettyVnode indentAfterRows node =
               children -> line <> vsep (map (prettyVnode True) children)
           ]
     ]
+  where
+    actualRows = node.actualRowsPerLoop * node.loops
+    predictedRows = node.predictedRowsPerLoop * node.loops
+    startupTime = node.startupTimePerLoop * realToFrac @Int @Double node.loops
+    totalTime = node.totalTimePerLoop * realToFrac @Int @Double node.loops
 
 nodeVnode :: Node -> Vnode
 nodeVnode = \case
@@ -104,6 +121,7 @@ nodeVnode = \case
   BitmapHeapScanNode info info2 -> bitmapHeapScanVnode info info2
   BitmapIndexScanNode info info2 -> bitmapIndexScanVnode info info2
   BitmapOrNode info -> bitmapOrVnode info
+  CteScanNode info info2 -> cteScanVnode info info2
   FunctionScanNode info info2 -> functionScanVnode info info2
   GatherNode info info2 -> gatherVnode info info2
   HashJoinNode info info2 -> hashJoinVnode info info2
@@ -136,8 +154,8 @@ aggregateVnode info info2 =
             "Group rows "
               <> case info2.groupKey of
                 Nothing -> mempty
-                Just key -> "by " <> prettyKey key
-              <> "with internal hash table"
+                Just key -> "by " <> prettyKey key <> " "
+              <> "with a hash table"
           AggregateStrategyPlain -> "Reduce to a single value"
           AggregateStrategyMixed -> "Mixed aggregation" -- TODO make this better
           AggregateStrategySorted ->
@@ -187,6 +205,12 @@ bitmapOrVnode :: NodeInfo -> Vnode
 bitmapOrVnode info =
   (makeVnode info)
     { summary = "Bitwise-or the bitmaps"
+    }
+
+cteScanVnode :: NodeInfo -> CteScanNodeInfo -> Vnode
+cteScanVnode info info2 =
+  (makeVnode info)
+    { summary = "Scan CTE " <> annotate italicized (pretty info2.cteName)
     }
 
 functionScanVnode :: NodeInfo -> FunctionScanNodeInfo -> Vnode
@@ -271,9 +295,10 @@ indexScanVnode info info2 =
 
 limitVnode :: NodeInfo -> Vnode
 limitVnode info =
-  (makeVnode info)
-    { summary = "Only emit a number of rows"
-    }
+  let vnode = makeVnode info
+   in vnode
+        { summary = "Limit " <> prettyInt vnode.actualRowsPerLoop
+        }
 
 materializeVnode :: NodeInfo -> Vnode
 materializeVnode info =
@@ -312,7 +337,7 @@ nestedLoopVnode info info2 =
 resultVnode :: NodeInfo -> ResultNodeInfo -> Vnode
 resultVnode info _info2 =
   (makeVnode info)
-    { summary = "Emit all rows"
+    { summary = "Result"
     }
 
 seqScanVnode :: NodeInfo -> SeqScanNodeInfo -> Vnode
@@ -343,28 +368,29 @@ setOpVnode info info2 =
 
 sortVnode :: NodeInfo -> SortNodeInfo -> Vnode
 sortVnode info info2 =
-  (makeVnode info)
-    { metadata =
-        [ case info2.sortSpaceType of
-            "Memory" -> "Memory: " <> annBytes (prettyKilobytes info2.sortSpaceUsed)
-            "Disk" -> "Disk: " <> annBytes (prettyKilobytes info2.sortSpaceUsed)
-            ty -> error ("Unknown sort type: " ++ Text.unpack ty)
-        ],
-      summary =
-        fold
-          [ pretty @Text case info2.sortMethod of
-              "external merge" -> "On-disk mergesort on "
-              "quicksort" -> "Quicksort on "
-              "top-N heapsort" -> "Top-N heapsort on "
-              method -> error ("Unknown sort method: " <> Text.unpack method),
-            hsep (punctuate comma (map (annotate italicized . pretty) info2.sortKey))
-          ]
-    }
+  let vnode = makeVnode info
+   in vnode
+        { metadata =
+            [ case info2.sortSpaceType of
+                "Memory" -> "Memory: " <> annBytes (prettyKilobytes info2.sortSpaceUsed)
+                "Disk" -> "Disk: " <> annBytes (prettyKilobytes info2.sortSpaceUsed)
+                ty -> error ("Unknown sort type: " ++ Text.unpack ty)
+            ],
+          summary =
+            fold
+              [ case info2.sortMethod of
+                  "external merge" -> "On-disk mergesort on "
+                  "quicksort" -> "Quicksort on "
+                  "top-N heapsort" -> "Top-" <> prettyInt vnode.actualRowsPerLoop <> " heapsort on "
+                  method -> error ("Unknown sort method: " <> Text.unpack method),
+                hsep (punctuate comma (map (annotate italicized . pretty) info2.sortKey))
+              ]
+        }
 
 subqueryScanVnode :: NodeInfo -> SubqueryScanNodeInfo -> Vnode
-subqueryScanVnode info _info2 =
+subqueryScanVnode info info2 =
   (makeVnode info)
-    { summary = "Subquery scan"
+    { summary = "Scan subquery " <> annotate italicized (pretty info2.alias)
     }
 
 uniqueVnode :: NodeInfo -> Vnode

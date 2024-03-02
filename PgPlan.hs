@@ -48,6 +48,12 @@ data BitmapIndexScanNodeInfo = BitmapIndexScanNodeInfo
   }
   deriving stock (Show)
 
+data CteScanNodeInfo = CteScanNodeInfo
+  { alias :: !Text,
+    cteName :: !Text
+  }
+  deriving stock (Show)
+
 data FunctionScanNodeInfo = FunctionScanNodeInfo
   { alias :: !Text,
     filter :: !(Maybe Text),
@@ -96,8 +102,7 @@ data IndexScanNodeInfo = IndexScanNodeInfo
     indexName :: !Text,
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int),
-    scanDirection :: !Text,
-    subplanName :: !(Maybe Text)
+    scanDirection :: !Text
   }
   deriving stock (Show)
 
@@ -141,6 +146,7 @@ data Node
   | BitmapHeapScanNode !NodeInfo !BitmapHeapScanNodeInfo
   | BitmapIndexScanNode !NodeInfo !BitmapIndexScanNodeInfo
   | BitmapOrNode !NodeInfo
+  | CteScanNode !NodeInfo !CteScanNodeInfo
   | FunctionScanNode !NodeInfo !FunctionScanNodeInfo
   | GatherNode !NodeInfo !GatherNodeInfo
   | HashJoinNode !NodeInfo !HashJoinNodeInfo
@@ -173,6 +179,7 @@ data NodeInfo = NodeInfo
     planWidth :: !Int,
     plans :: ![Node],
     startupCost :: !Double,
+    subplanName :: !(Maybe Text),
     totalCost :: !Double
   }
   deriving stock (Show)

@@ -34,6 +34,7 @@ instance FromJSON Node where
         "Bitmap Heap Scan" -> go BitmapHeapScanNode parseBitmapHeapScanNodeInfo
         "Bitmap Index Scan" -> go BitmapIndexScanNode parseBitmapIndexScanNodeInfo
         "BitmapOr" -> pure (BitmapOrNode info)
+        "CTE Scan" -> go CteScanNode parseCteScanNodeInfo
         "Function Scan" -> go FunctionScanNode parseFunctionScanNodeInfo
         "Gather" -> go GatherNode parseGatherNodeInfo
         "Hash Join" -> go HashJoinNode parseHashJoinNodeInfo
@@ -100,6 +101,12 @@ parseBitmapIndexScanNodeInfo object = do
   indexName <- parseField @Text object "Index Name"
   pure BitmapIndexScanNodeInfo {..}
 
+parseCteScanNodeInfo :: Object -> Parser CteScanNodeInfo
+parseCteScanNodeInfo object = do
+  alias <- parseField @Text object "Alias"
+  cteName <- parseField @Text object "CTE Name"
+  pure CteScanNodeInfo {..}
+
 parseFunctionScanNodeInfo :: Object -> Parser FunctionScanNodeInfo
 parseFunctionScanNodeInfo object = do
   alias <- parseField @Text object "Alias"
@@ -150,7 +157,6 @@ parseIndexScanNodeInfo object = do
   relationName <- parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
   scanDirection <- parseField @Text object "Scan Direction"
-  subplanName <- parseFieldMaybe' @Text object "Subplan Name"
   pure IndexScanNodeInfo {..}
 
 parseJoinType :: Value -> Parser JoinType
@@ -202,6 +208,7 @@ parseNodeInfo object = do
   planWidth <- parseField @Int object "Plan Width"
   plans <- fromMaybe [] <$> parseFieldMaybe' @[Node] object "Plans"
   startupCost <- parseField @Double object "Startup Cost"
+  subplanName <- parseFieldMaybe' @Text object "Subplan Name"
   totalCost <- parseField @Double object "Total Cost"
   pure NodeInfo {..}
 
