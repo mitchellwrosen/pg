@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Control.Applicative (asum)
+import Control.Applicative (asum, many)
 import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.Aeson qualified as Aeson
@@ -60,6 +60,7 @@ main = do
             ( pgExplain
                 <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
                 <*> textArg [Opt.metavar "QUERY"]
+                <*> many (textArg [Opt.metavar "PARAMETER"])
             ),
           subcommand
             [ Opt.progDesc "Load a Postgres database."
@@ -145,8 +146,8 @@ pgExec query = do
   Text.putStr err
   exitWith code
 
-pgExplain :: Maybe Text -> Text -> IO ()
-pgExplain maybeDatabase queryOrFilename = do
+pgExplain :: Maybe Text -> Text -> [Text] -> IO ()
+pgExplain maybeDatabase queryOrFilename parameters = do
   dbname <- resolveValue (Def (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) (pure "postgres"))
   host <-
     resolveValue $
@@ -166,14 +167,27 @@ pgExplain maybeDatabase queryOrFilename = do
       False -> pure queryOrFilename
       True -> Text.readFile (Text.unpack queryOrFilename)
   username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+
+  let command =
+        let explain = ("EXPLAIN (ANALYZE ON, FORMAT JSON) " <>)
+         in if null parameters
+              then explain query
+              else
+                "PREPARE query AS "
+                  <> query
+                  <> "; "
+                  <> explain ("EXECUTE query(" <> Text.intercalate ", " parameters <> ")")
+
   (out, err, code) <-
     process
       "psql"
-      [ "--command=EXPLAIN (ANALYZE ON, FORMAT JSON) " <> query,
+      [ "--command=" <> command,
         "--dbname=" <> dbname,
         "--host=" <> host,
         "--no-align",
         "--port=" <> port,
+        -- This silences the "PREPARE" output, if we prepare
+        "--quiet",
         "--tuples-only",
         "--username=" <> username
       ]
