@@ -15,11 +15,13 @@ executable pg
     prettyprinter-ansi-terminal == 1.1.3,
     process == 1.6.18.0,
     text == 2.1.1,
+    text-ansi == 0.3.0.1,
     unix == 2.8.5.0,
   default-extensions:
     BlockArguments
     DerivingStrategies
     DuplicateRecordFields
+    GADTs
     LambdaCase
     OverloadedRecordDot
     OverloadedStrings

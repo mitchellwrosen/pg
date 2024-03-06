@@ -25,7 +25,8 @@ instance FromJSON Node where
   parseJSON =
     withObject "Node" \object -> do
       info <- parseNodeInfo object
-      let go constructor parse = do
+      let go :: (NodeInfo -> a -> Node) -> (Object -> Parser a) -> Parser Node
+          go constructor parse = do
             info2 <- parse object
             pure (constructor info info2)
       parseField @Text object "Node Type" >>= \case

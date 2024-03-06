@@ -8,7 +8,6 @@ import Data.ByteString qualified as ByteString
 import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Functor (void)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
@@ -21,10 +20,12 @@ import PgPlanPretty (prettyAnalyze)
 import Prettyprinter qualified
 import Prettyprinter.Render.Terminal qualified
 import System.Directory qualified as Directory
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO qualified as IO
 import System.Posix.ByteString qualified as Posix
 import System.Process qualified as Process
+import Text.ANSI qualified
 import Text.Read (readMaybe)
 import Prelude hiding (filter, lines, read)
 
@@ -85,97 +86,127 @@ pgCreate :: IO ()
 pgCreate = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
-  Directory.doesDirectoryExist (Text.unpack clusterDir) >>= \case
-    True -> Text.putStrLn ("There's already a Postgres cluster at " <> clusterDir)
-    False -> do
-      (out, err, code) <-
-        process
-          "initdb"
-          [ "--encoding=UTF8",
-            "--locale=en_US.UTF-8",
-            "--no-sync",
-            "--pgdata=" <> clusterDir
-          ]
-      when (code /= ExitSuccess) do
-        Text.putStr out
-        Text.putStr err
-        exitWith code
+  whenM (Directory.doesDirectoryExist (Text.unpack clusterDir)) do
+    Text.putStrLn ("There's already a Postgres cluster at " <> clusterDir)
+    exitFailure
+  (out, err, code) <-
+    process
+      "initdb"
+      [ "--encoding=UTF8",
+        "--locale=en_US.UTF-8",
+        "--no-sync",
+        "--pgdata=" <> clusterDir,
+        "--username=postgres"
+      ]
+  when (code /= ExitSuccess) do
+    Text.putStr out
+    Text.putStr err
+    exitWith code
 
 pgDown :: IO ()
 pgDown = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   let postmasterFile = clusterDir <> "/postmaster.pid"
-  Directory.doesFileExist (Text.unpack postmasterFile) >>= \case
-    False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
-    True ->
-      (Text.lines <$> Text.readFile (Text.unpack postmasterFile)) >>= \case
-        (readMaybe . Text.unpack -> Just pid) : _ -> Posix.signalProcess Posix.sigTERM pid
-        _ -> Text.putStrLn ("Could not read PID from " <> postmasterFile)
+  whenNotM (Directory.doesFileExist (Text.unpack postmasterFile)) do
+    Text.putStrLn ("There's no cluster running at " <> clusterDir)
+    exitFailure
+  (Text.lines <$> Text.readFile (Text.unpack postmasterFile)) >>= \case
+    (readMaybe . Text.unpack -> Just pid) : _ -> Posix.signalProcess Posix.sigTERM pid
+    _ -> Text.putStrLn ("Could not read PID from " <> postmasterFile)
 
 pgExec :: Text -> IO ()
 pgExec query = do
-  stateDir <- getStateDir
-  let clusterDir = stateDir <> "/data"
-  Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
-    False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
-    True -> do
-      (out, err, code) <-
-        process
-          "psql"
-          [ "--command=" <> query,
-            "--dbname=postgres",
-            "--host=" <> stateDir
-          ]
-      Text.putStr out
-      Text.putStr err
-      exitWith code
+  dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
+  host <-
+    resolveValue $
+      Def
+        (TextEnv "PGHOST")
+        ( do
+            stateDir <- getStateDir
+            let clusterDir = stateDir <> "/data"
+            whenNotM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
+              Text.putStrLn ("There's no cluster running at " <> clusterDir)
+              exitFailure
+            pure stateDir
+        )
+  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  (out, err, code) <-
+    process
+      "psql"
+      [ "--command=" <> query,
+        "--dbname=" <> dbname,
+        "--host=" <> host,
+        "--port=" <> port,
+        "--username=" <> username
+      ]
+  Text.putStr out
+  Text.putStr err
+  exitWith code
 
 pgExplain :: Maybe Text -> Text -> IO ()
 pgExplain maybeDatabase queryOrFilename = do
-  stateDir <- getStateDir
-  let clusterDir = stateDir <> "/data"
-  Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
-    False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
-    True -> do
-      query <-
-        Directory.doesFileExist (Text.unpack queryOrFilename) >>= \case
-          False -> pure queryOrFilename
-          True -> Text.readFile (Text.unpack queryOrFilename)
-      (out, err, code) <-
-        process
-          "psql"
-          [ "--command=EXPLAIN (ANALYZE ON, FORMAT JSON) " <> query,
-            "--dbname=" <> fromMaybe "postgres" maybeDatabase,
-            "--host=" <> stateDir,
-            "--no-align",
-            "--tuples-only"
-          ]
-      if code == ExitSuccess
-        then do
-          Text.putStrLn out
-          Text.putStrLn query
-          case Aeson.eitherDecodeStrictText @[Analyze] out of
-            Left parseError -> Text.putStrLn (Text.pack parseError)
-            Right (head -> analyze) ->
-              analyze
-                & prettyAnalyze
-                & Prettyprinter.layoutPretty (Prettyprinter.LayoutOptions Prettyprinter.Unbounded)
-                & Prettyprinter.Render.Terminal.renderStrict
-                & Text.putStrLn
-        else do
-          Text.putStr out
-          Text.putStr err
-      exitWith code
+  dbname <- resolveValue (Def (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) (pure "postgres"))
+  host <-
+    resolveValue $
+      Def
+        (TextEnv "PGHOST")
+        ( do
+            stateDir <- getStateDir
+            let clusterDir = stateDir <> "/data"
+            whenNotM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
+              Text.putStrLn ("There's no cluster running at " <> clusterDir)
+              exitFailure
+            pure stateDir
+        )
+  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  query <-
+    Directory.doesFileExist (Text.unpack queryOrFilename) >>= \case
+      False -> pure queryOrFilename
+      True -> Text.readFile (Text.unpack queryOrFilename)
+  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  (out, err, code) <-
+    process
+      "psql"
+      [ "--command=EXPLAIN (ANALYZE ON, FORMAT JSON) " <> query,
+        "--dbname=" <> dbname,
+        "--host=" <> host,
+        "--no-align",
+        "--port=" <> port,
+        "--tuples-only",
+        "--username=" <> username
+      ]
+  if code == ExitSuccess
+    then do
+      Text.putStrLn out
+      Text.putStrLn query
+      case Aeson.eitherDecodeStrictText @[Analyze] out of
+        Left parseError -> Text.putStrLn (Text.pack parseError)
+        Right (head -> analyze) ->
+          analyze
+            & prettyAnalyze
+            & Prettyprinter.layoutPretty (Prettyprinter.LayoutOptions Prettyprinter.Unbounded)
+            & Prettyprinter.Render.Terminal.renderStrict
+            & Text.putStrLn
+    else do
+      Text.putStr out
+      Text.putStr err
+  exitWith code
 
 pgLoad :: Maybe Text -> Text -> IO ()
 pgLoad maybeDatabase file = do
-  stateDir <- getStateDir
+  dbname <- resolveValue (Def (Opt maybeDatabase) (pure "postgres"))
+  host <- getStateDir
+  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
   (out, err, code) <-
     process
       "pg_restore"
-      [ "--dbname=" <> fromMaybe "postgres" maybeDatabase,
-        "--host=" <> stateDir,
+      [ "--dbname=" <> dbname,
+        "--host=" <> host,
+        "--port=" <> port,
+        "--username=" <> username,
         file
       ]
   when (code /= ExitSuccess) do
@@ -185,47 +216,57 @@ pgLoad maybeDatabase file = do
 
 pgRepl :: IO ()
 pgRepl = do
-  stateDir <- getStateDir
-  let clusterDir = stateDir <> "/data"
-  Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
-    False -> Text.putStrLn ("There's no cluster running at " <> clusterDir)
-    True -> do
-      code <-
-        foreground
-          "psql"
-          [ "--dbname=postgres",
-            "--host=" <> stateDir
-          ]
-      exitWith code
+  dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
+  host <-
+    resolveValue $
+      Def
+        (TextEnv "PGHOST")
+        ( do
+            stateDir <- getStateDir
+            let clusterDir = stateDir <> "/data"
+            whenNotM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
+              Text.putStrLn ("There's no cluster running at " <> clusterDir)
+              exitFailure
+            pure stateDir
+        )
+  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  code <-
+    foreground
+      "psql"
+      [ "--dbname=" <> dbname,
+        "--host=" <> host,
+        "--port=" <> port,
+        "--username=" <> username
+      ]
+  exitWith code
 
 pgUp :: IO ()
 pgUp = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   let logFile = stateDir <> "/log.txt"
-  Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid")) >>= \case
-    False -> do
-      Directory.createDirectoryIfMissing True (Text.unpack stateDir)
-      background
-        "postgres"
-        [ "-D",
-          clusterDir,
+  whenNotM (Directory.doesDirectoryExist (Text.unpack clusterDir)) do
+    Text.putStrLn ("There's no cluster at " <> clusterDir)
+    exitFailure
+  whenM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
+    Text.putStrLn ("There's already a cluster running at " <> clusterDir)
+    exitFailure
+  background
+    "postgres"
+    ( fold
+        [ ["-D", clusterDir],
           -- disable fsync
-          "-F",
+          ["-F"],
           -- don't listen on IP
-          "-h",
-          "",
+          ["-h", ""],
           -- unix socket directory
-          "-k",
-          stateDir
+          ["-k", stateDir]
         ]
-        logFile
-      Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
-      void (foreground "tail" ["-f", logFile])
-    True -> Text.putStrLn ("There's already a cluster running at " <> clusterDir)
-
-------------------------------------------------------------------------------------------------------------------------
--- EXPLAIN ANALYZE json utils
+    )
+    logFile
+  Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
+  void (foreground "tail" ["-f", logFile])
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Cli utils
@@ -254,6 +295,19 @@ textOpt :: [Opt.Mod Opt.OptionFields Text] -> Opt.Parser (Maybe Text)
 textOpt opts =
   optional (Opt.strOption (fold opts))
 
+data Val a where
+  Def :: Val (Maybe a) -> IO a -> Val a
+  Opt :: Maybe a -> Val (Maybe a)
+  Or :: Val (Maybe a) -> Val (Maybe a) -> Val (Maybe a)
+  TextEnv :: !Text -> Val (Maybe Text)
+
+resolveValue :: Val a -> IO a
+resolveValue = \case
+  Def x y -> resolveValue x >>= maybe y pure
+  Opt x -> pure x
+  Or x y -> resolveValue x >>= maybe (resolveValue y) (pure . Just)
+  TextEnv x -> fmap (Text.pack) <$> lookupEnv (Text.unpack x)
+
 ------------------------------------------------------------------------------------------------------------------------
 -- Subprocess utils
 
@@ -279,6 +333,9 @@ background name args logfile = do
                 Process.std_out = Process.UseHandle logfileHandle,
                 Process.use_process_jobs = False
               }
+
+      printProcess name args
+
       void (Process.createProcess config)
 
 foreground :: Text -> [Text] -> IO ExitCode
@@ -305,6 +362,8 @@ foreground name args = do
   let cleanup (_, _, _, handle) = do
         Process.terminateProcess handle
         void (Process.waitForProcess handle)
+
+  printProcess name args
 
   bracket (Process.createProcess config) cleanup \(_, _, _, handle) ->
     Process.waitForProcess handle
@@ -337,11 +396,22 @@ process name args = do
               Process.terminateProcess handle
               void (Process.waitForProcess handle)
 
+        printProcess name args
+
         bracket (Process.createProcess config) cleanup \(_, _, _, handle) -> do
           exitCode <- Process.waitForProcess handle
           out <- ByteString.hGetContents stdoutReadHandle
           err <- ByteString.hGetContents stderrReadHandle
           pure (Text.decodeUtf8 out, Text.decodeUtf8 err, exitCode)
+
+printProcess :: Text -> [Text] -> IO ()
+printProcess name args =
+  Text.putStrLn (Text.ANSI.bold (Text.unwords (name : map quote args)))
+  where
+    quote arg
+      | Text.null arg = "''"
+      | Text.any (== ' ') arg = "'" <> Text.replace "'" "\\'" arg <> "'"
+      | otherwise = arg
 
 withDevNull :: (IO.Handle -> IO a) -> IO a
 withDevNull =
@@ -385,6 +455,16 @@ getStateDir = do
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Misc missing prelude functions
+
+whenM :: (Monad m) => m Bool -> m () -> m ()
+whenM mx my = do
+  x <- mx
+  when x my
+
+whenNotM :: (Monad m) => m Bool -> m () -> m ()
+whenNotM mx my = do
+  x <- mx
+  when (not x) my
 
 onNothingM :: (Monad m) => m a -> m (Maybe a) -> m a
 onNothingM mx my =
