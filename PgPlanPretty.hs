@@ -356,13 +356,13 @@ setOpVnode info info2 =
     { summary =
         fold
           [ case info2.command of
-              SetOpCommandExcept -> "Except "
-              SetOpCommandExceptAll -> "Except all "
-              SetOpCommandIntersect -> "Intersect "
-              SetOpCommandIntersectAll -> "Intersect all ",
+              SetOpCommandExcept -> "Emit rows in the EXCEPT"
+              SetOpCommandExceptAll -> "Emit rows in the EXCEPT ALL"
+              SetOpCommandIntersect -> "Emit rows in the INTERSECT"
+              SetOpCommandIntersectAll -> "Emit rows in the INTERSECT ALL",
             case info2.strategy of
-              SetOpStrategyHashed -> "(hashed)"
-              SetOpStrategySorted -> "(sorted)"
+              SetOpStrategyHashed -> " using a hash table of row counts"
+              SetOpStrategySorted -> mempty
           ]
     }
 
