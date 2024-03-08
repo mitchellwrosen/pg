@@ -261,7 +261,36 @@ pgRepl = do
       [ "--dbname=" <> dbname,
         "--host=" <> host,
         "--port=" <> port,
-        "--username=" <> username
+        "--username=" <> username,
+        let style x y = "%[%033[" <> Text.intercalate ";" x <> "m%]" <> y <> "%[%033[0m%]"
+            blue = "34"
+            bold = "1"
+            green = "32"
+            italic = "3"
+            magenta = "35"
+            yellow = "33"
+         in fold
+              [ "--variable=PROMPT1=",
+                "╭ ",
+                style [italic, yellow] "host",
+                " ",
+                style [bold, yellow] "%M",
+                "\n│ ",
+                style [italic, green] "port",
+                " ",
+                style [bold, green] "%>",
+                "\n│ ",
+                style [italic, magenta] "user",
+                " ",
+                style [bold, magenta] "%n",
+                "\n│ ",
+                style [italic, blue] "database",
+                " ",
+                style [bold, blue] "%/",
+                "\n╰ ",
+                "%# " -- # (superuser) or > (user)
+              ],
+        "--variable=PROMPT2=%w "
       ]
   exitWith code
 
