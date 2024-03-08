@@ -117,7 +117,7 @@ pgDown = do
     _ -> Text.putStrLn ("Could not read PID from " <> postmasterFile)
 
 pgExec :: Text -> IO ()
-pgExec query = do
+pgExec queryOrFilename = do
   dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
   host <-
     resolveValue $
@@ -132,6 +132,10 @@ pgExec query = do
             pure stateDir
         )
   port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  query <-
+    Directory.doesFileExist (Text.unpack queryOrFilename) >>= \case
+      False -> pure queryOrFilename
+      True -> Text.readFile (Text.unpack queryOrFilename)
   username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
   (out, err, code) <-
     process
@@ -168,29 +172,35 @@ pgExplain maybeDatabase queryOrFilename parameters = do
       True -> Text.readFile (Text.unpack queryOrFilename)
   username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
 
-  let command =
+  let commands =
         let explain = ("EXPLAIN (ANALYZE ON, FORMAT JSON) " <>)
-         in if null parameters
-              then explain query
-              else
-                "PREPARE query AS "
-                  <> query
-                  <> "; "
-                  <> explain ("EXECUTE query(" <> Text.intercalate ", " parameters <> ")")
+         in fold
+              [ -- '\x on' puts a "QUERY PLAN|" slug in the output, so turn it off
+                ["--command=\\x off"],
+                if null parameters
+                  then [explain query]
+                  else
+                    [ "PREPARE query AS " <> query,
+                      explain ("EXECUTE query(" <> Text.intercalate ", " parameters <> ")")
+                    ]
+              ]
 
   (out, err, code) <-
     process
       "psql"
-      [ "--command=" <> command,
-        "--dbname=" <> dbname,
-        "--host=" <> host,
-        "--no-align",
-        "--port=" <> port,
-        -- This silences the "PREPARE" output, if we prepare
-        "--quiet",
-        "--tuples-only",
-        "--username=" <> username
-      ]
+      ( fold
+          [ map ("--command=" <>) commands,
+            [ "--dbname=" <> dbname,
+              "--host=" <> host,
+              "--no-align",
+              "--port=" <> port,
+              -- This silences the "PREPARE" output, if we prepare
+              "--quiet",
+              "--tuples-only",
+              "--username=" <> username
+            ]
+          ]
+      )
   if code == ExitSuccess
     then do
       Text.putStrLn out
