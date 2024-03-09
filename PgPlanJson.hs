@@ -147,7 +147,7 @@ parseIndexOnlyScanNodeInfo object = do
   indexName <- parseField @Text object "Index Name"
   relationName <- parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
-  scanDirection <- parseField @Text object "Scan Direction"
+  scanDirection <- explicitParseField parseScanDirection object "Scan Direction"
   pure IndexOnlyScanNodeInfo {..}
 
 parseIndexScanNodeInfo :: Object -> Parser IndexScanNodeInfo
@@ -157,7 +157,7 @@ parseIndexScanNodeInfo object = do
   indexName <- parseField @Text object "Index Name"
   relationName <- parseField @Text object "Relation Name"
   rowsRemovedByIndexRecheck <- parseFieldMaybe' @Int object "Rows Removed by Index Recheck"
-  scanDirection <- parseField @Text object "Scan Direction"
+  scanDirection <- explicitParseField parseScanDirection object "Scan Direction"
   pure IndexScanNodeInfo {..}
 
 parseJoinType :: Value -> Parser JoinType
@@ -217,6 +217,13 @@ parseResultNodeInfo :: Object -> Parser ResultNodeInfo
 parseResultNodeInfo object = do
   oneTimeFilter <- parseFieldMaybe' @Text object "One-Time Filter"
   pure ResultNodeInfo {..}
+
+parseScanDirection :: Value -> Parser ScanDirection
+parseScanDirection =
+  withText "ScanDirection" \case
+    "Backward" -> pure ScanDirectionBackward
+    "Forward" -> pure ScanDirectionForward
+    dir -> fail ("Unknown scan direction: " ++ Text.unpack dir)
 
 parseSeqScanNodeInfo :: Object -> Parser SeqScanNodeInfo
 parseSeqScanNodeInfo object = do

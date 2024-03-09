@@ -92,7 +92,7 @@ data IndexOnlyScanNodeInfo = IndexOnlyScanNodeInfo
     indexName :: !Text,
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int),
-    scanDirection :: !Text
+    scanDirection :: !ScanDirection
   }
   deriving stock (Show)
 
@@ -102,7 +102,7 @@ data IndexScanNodeInfo = IndexScanNodeInfo
     indexName :: !Text,
     relationName :: !Text,
     rowsRemovedByIndexRecheck :: !(Maybe Int),
-    scanDirection :: !Text
+    scanDirection :: !ScanDirection
   }
   deriving stock (Show)
 
@@ -187,6 +187,11 @@ data NodeInfo = NodeInfo
 data ResultNodeInfo = ResultNodeInfo
   { oneTimeFilter :: !(Maybe Text)
   }
+  deriving stock (Show)
+
+data ScanDirection
+  = ScanDirectionBackward
+  | ScanDirectionForward
   deriving stock (Show)
 
 data SeqScanNodeInfo = SeqScanNodeInfo

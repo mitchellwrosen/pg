@@ -5,6 +5,7 @@ where
 
 import Data.Fixed (mod')
 import Data.Foldable (fold)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Lazy.Builder qualified as Builder
@@ -22,6 +23,7 @@ data Vnode = Vnode
     loops :: !Int,
     metadata :: ![Doc AnsiStyle],
     name :: !(Maybe Text),
+    nodeName :: !Text,
     predictedRowsPerLoop :: !Int,
     relationship :: !(Maybe Text),
     rowBytes :: !Int,
@@ -32,8 +34,8 @@ data Vnode = Vnode
     totalTimePerLoop :: !Double
   }
 
-makeVnode :: NodeInfo -> Vnode
-makeVnode info =
+makeVnode :: Text -> NodeInfo -> Vnode
+makeVnode nodeName info =
   Vnode
     { actualRowsPerLoop = info.actualRows,
       children = map nodeVnode info.plans,
@@ -43,6 +45,10 @@ makeVnode info =
         case info.parentRelationship of
           Just "SubPlan" -> Just "Correlated subquery, run once for every row emitted by parent"
           _ -> info.subplanName,
+      nodeName =
+        let parallel = if info.parallelAware then ("Parallel " <>) else id
+            async = if fromMaybe False info.asyncCapable then ("Async " <>) else id
+         in parallel (async nodeName),
       predictedRowsPerLoop = info.planRows,
       relationship = info.parentRelationship,
       rowBytes = info.planWidth,
@@ -78,12 +84,10 @@ prettyVnode indentAfterRows node =
               Nothing -> mempty
               Just s -> vbar <> annotate (color Black) ("# " <> pretty s) <> line,
             vbar,
-            annotate
-              bold
-              ( if node.loops == 1
-                  then node.summary
-                  else prettyInt node.loops <> "x " <> node.summary
-              ),
+            annotate bold (pretty node.nodeName),
+            if node.loops == 1 then mempty else annotate italicized (" (" <> prettyInt node.loops <> "x)"),
+            line,
+            vsep (map (vbar <>) [node.summary]),
             line,
             vsep (map (vbar <>) node.metadata),
             if null node.metadata then mempty else line,
@@ -143,7 +147,7 @@ nodeVnode = \case
 
 aggregateVnode :: NodeInfo -> AggregateNodeInfo -> Vnode
 aggregateVnode info info2 =
-  (makeVnode info)
+  (makeVnode name info)
     { metadata =
         case info2.peakMemoryUsage of
           Nothing -> []
@@ -165,6 +169,13 @@ aggregateVnode info info2 =
                 Just key -> " by " <> prettyKey key
     }
   where
+    name =
+      case info2.strategy of
+        AggregateStrategyHashed -> "HashAggregate"
+        AggregateStrategyMixed -> "MixedAggregate"
+        AggregateStrategyPlain -> "Aggregate"
+        AggregateStrategySorted -> "GroupAggregate"
+
     prettyKey key =
       hsep
         ( punctuate
@@ -174,13 +185,13 @@ aggregateVnode info info2 =
 
 appendVnode :: NodeInfo -> AppendNodeInfo -> Vnode
 appendVnode info _info2 =
-  (makeVnode info)
-    { summary = "Emit all rows"
+  (makeVnode "Append" info)
+    { summary = "Emit all rows from first child, then second, and so on (async children interspersed)"
     }
 
 bitmapHeapScanVnode :: NodeInfo -> BitmapHeapScanNodeInfo -> Vnode
 bitmapHeapScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Bitmap Heap Scan" info)
     { metadata = filterLine (Just info2.recheckCond) info2.rowsRemovedByIndexRecheck,
       summary =
         "Access bitmapped pages in table "
@@ -192,7 +203,7 @@ bitmapHeapScanVnode info info2 =
 
 bitmapIndexScanVnode :: NodeInfo -> BitmapIndexScanNodeInfo -> Vnode
 bitmapIndexScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Bitmap Index Scan" info)
     { summary =
         "Access "
           <> case info2.indexCond of
@@ -203,26 +214,26 @@ bitmapIndexScanVnode info info2 =
 
 bitmapOrVnode :: NodeInfo -> Vnode
 bitmapOrVnode info =
-  (makeVnode info)
+  (makeVnode "Bitmap Or" info)
     { summary = "Bitwise-or the bitmaps"
     }
 
 cteScanVnode :: NodeInfo -> CteScanNodeInfo -> Vnode
 cteScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode "CTE Scan" info)
     { summary = "Scan CTE " <> annotate italicized (pretty info2.cteName)
     }
 
 functionScanVnode :: NodeInfo -> FunctionScanNodeInfo -> Vnode
 functionScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Function Scan" info)
     { metadata = filterLine info2.filter info2.rowsRemovedByFilter,
       summary = "Execute function " <> annotate italicized (pretty info2.functionName)
     }
 
 gatherVnode :: NodeInfo -> GatherNodeInfo -> Vnode
 gatherVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Gather" info)
     { summary =
         "Parallelize with "
           <> pretty info2.workersLaunched
@@ -234,7 +245,7 @@ gatherVnode info info2 =
 
 hashVnode :: Bool -> NodeInfo -> HashNodeInfo -> Vnode
 hashVnode innerUnique info info2 =
-  (makeVnode info)
+  (makeVnode "Hash" info)
     { metadata = ["Peak memory usage: " <> annBytes (prettyKilobytes info2.peakMemoryUsage)],
       summary =
         "Build a "
@@ -244,7 +255,7 @@ hashVnode innerUnique info info2 =
 
 hashJoinVnode :: NodeInfo -> HashJoinNodeInfo -> Vnode
 hashJoinVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Hash Join" info)
     { children =
         case info.plans of
           [outer, HashNode innerInfo innerInfo2] -> [nodeVnode outer, hashVnode info2.innerUnique innerInfo innerInfo2]
@@ -261,7 +272,7 @@ hashJoinVnode info info2 =
 
 indexOnlyScanVnode :: NodeInfo -> IndexOnlyScanNodeInfo -> Vnode
 indexOnlyScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode name info)
     { summary =
         fold
           [ "Access ",
@@ -278,10 +289,15 @@ indexOnlyScanVnode info info2 =
               else mempty
           ]
     }
+  where
+    name =
+      case info2.scanDirection of
+        ScanDirectionBackward -> "Index Only Scan Backward"
+        ScanDirectionForward -> "Index Only Scan"
 
 indexScanVnode :: NodeInfo -> IndexScanNodeInfo -> Vnode
 indexScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode name info)
     { summary =
         fold
           [ "Access ",
@@ -292,29 +308,34 @@ indexScanVnode info info2 =
             annTable info2.relationName
           ]
     }
+  where
+    name =
+      case info2.scanDirection of
+        ScanDirectionBackward -> "Index Scan Backward"
+        ScanDirectionForward -> "Index Scan"
 
 limitVnode :: NodeInfo -> Vnode
 limitVnode info =
-  let vnode = makeVnode info
+  let vnode = makeVnode "Limit" info
    in vnode
         { summary = "Limit " <> prettyInt vnode.actualRowsPerLoop
         }
 
 materializeVnode :: NodeInfo -> Vnode
 materializeVnode info =
-  (makeVnode info)
+  (makeVnode "Materialize" info)
     { summary = "Materialize"
     }
 
 memoizeVnode :: NodeInfo -> MemoizeNodeInfo -> Vnode
 memoizeVnode info _info2 =
-  (makeVnode info)
+  (makeVnode "Memoize" info)
     { summary = "Memoize"
     }
 
 mergeJoinVnode :: NodeInfo -> MergeJoinNodeInfo -> Vnode
 mergeJoinVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Merge Join" info)
     { summary =
         fold
           [ prettyJoinType info2.joinType,
@@ -327,7 +348,7 @@ mergeJoinVnode info info2 =
 
 nestedLoopVnode :: NodeInfo -> NestedLoopNodeInfo -> Vnode
 nestedLoopVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Nested Loop" info)
     { summary =
         prettyJoinType info2.joinType
           <> " nested loop join"
@@ -336,13 +357,13 @@ nestedLoopVnode info info2 =
 
 resultVnode :: NodeInfo -> ResultNodeInfo -> Vnode
 resultVnode info _info2 =
-  (makeVnode info)
+  (makeVnode "Result" info)
     { summary = "Result"
     }
 
 seqScanVnode :: NodeInfo -> SeqScanNodeInfo -> Vnode
 seqScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Seq Scan" info)
     { metadata = filterLine info2.filter info2.rowsRemovedByFilter,
       summary =
         "Access table "
@@ -352,23 +373,45 @@ seqScanVnode info info2 =
 
 setOpVnode :: NodeInfo -> SetOpNodeInfo -> Vnode
 setOpVnode info info2 =
-  (makeVnode info)
+  (makeVnode name info)
     { summary =
         fold
-          [ case info2.command of
-              SetOpCommandExcept -> "Emit rows in the EXCEPT"
-              SetOpCommandExceptAll -> "Emit rows in the EXCEPT ALL"
-              SetOpCommandIntersect -> "Emit rows in the INTERSECT"
-              SetOpCommandIntersectAll -> "Emit rows in the INTERSECT ALL",
+          [ let except = "rows that are in the first relation but not in the second"
+                intersect = "rows that are in both relations"
+             in hsep
+                  [ "Emit",
+                    case info2.command of
+                      SetOpCommandExcept -> "distinct"
+                      SetOpCommandExceptAll -> "all"
+                      SetOpCommandIntersect -> "distinct"
+                      SetOpCommandIntersectAll -> "all",
+                    case info2.command of
+                      SetOpCommandExcept -> except
+                      SetOpCommandExceptAll -> except
+                      SetOpCommandIntersect -> intersect
+                      SetOpCommandIntersectAll -> intersect
+                  ],
             case info2.strategy of
               SetOpStrategyHashed -> " using a hash table of row counts"
               SetOpStrategySorted -> mempty
           ]
     }
+  where
+    name =
+      Text.unwords
+        [ case info2.strategy of
+            SetOpStrategyHashed -> "HashSetOp"
+            SetOpStrategySorted -> "SetOp",
+          case info2.command of
+            SetOpCommandExcept -> "Except"
+            SetOpCommandExceptAll -> "Except All"
+            SetOpCommandIntersect -> "Intersect"
+            SetOpCommandIntersectAll -> "Intersect All"
+        ]
 
 sortVnode :: NodeInfo -> SortNodeInfo -> Vnode
 sortVnode info info2 =
-  let vnode = makeVnode info
+  let vnode = makeVnode "Sort" info
    in vnode
         { metadata =
             [ case info2.sortSpaceType of
@@ -389,19 +432,19 @@ sortVnode info info2 =
 
 subqueryScanVnode :: NodeInfo -> SubqueryScanNodeInfo -> Vnode
 subqueryScanVnode info info2 =
-  (makeVnode info)
+  (makeVnode "Subquery Scan" info)
     { summary = "Scan subquery " <> annotate italicized (pretty info2.alias)
     }
 
 uniqueVnode :: NodeInfo -> Vnode
 uniqueVnode info =
-  (makeVnode info)
+  (makeVnode "Unique" info)
     { summary = "Only emit distinct rows"
     }
 
 valuesScanVnode :: NodeInfo -> ValuesScanNodeInfo -> Vnode
 valuesScanVnode info _info2 =
-  (makeVnode info)
+  (makeVnode "Values Scan" info)
     { summary = "Emit row literals"
     }
 
@@ -460,13 +503,13 @@ prettyJoinType = \case
 
 prettyKilobytes :: Int -> Doc a
 prettyKilobytes kb
-  | kb < 995 = pretty kb <> " kb"
-  | kb < 9_950 = prettyDouble 2 mb
-  | kb < 99_500 = prettyDouble 1 mb
-  | kb < 995_000 = prettyDouble 0 mb
-  | kb < 9_950_000 = prettyDouble 2 gb
-  | kb < 99_500_000 = prettyDouble 1 gb
-  | otherwise = prettyDouble 0 gb
+  | kb < 995 = pretty kb <> " kilobytes"
+  | kb < 9_950 = prettyDouble 2 mb <> " megabytes"
+  | kb < 99_500 = prettyDouble 1 mb <> " megabytes"
+  | kb < 995_000 = prettyDouble 0 mb <> " megabytes"
+  | kb < 9_950_000 = prettyDouble 2 gb <> " gigabytes"
+  | kb < 99_500_000 = prettyDouble 1 gb <> " gigabytes"
+  | otherwise = prettyDouble 0 gb <> " gigabytes"
   where
     mb = realToFrac @Int @Double kb / 1_000
     gb = realToFrac @Int @Double kb / 1_000_000
