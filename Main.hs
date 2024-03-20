@@ -6,13 +6,17 @@ import Control.Exception (SomeAsyncException (..), SomeException, bracket, fromE
 import Control.Monad (when)
 import Data.Aeson qualified as Aeson
 import Data.ByteString qualified as ByteString
-import Data.Foldable (fold)
+import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
+import Data.Text.Read qualified as Text
+import Data.Traversable (for)
+import Hasql.Connection qualified as Hasql
+import Hasql.Session qualified as Hasql
 import Network.Socket qualified as Network
 import Options.Applicative (optional)
 import Options.Applicative qualified as Opt
@@ -20,8 +24,9 @@ import PgPlan (Analyze)
 import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
-import Prettyprinter qualified
-import Prettyprinter.Render.Terminal qualified
+import PgPrettyUtils (putPretty)
+import PgQueries qualified
+import PgTablePretty (prettyTable)
 import System.Directory qualified as Directory
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -83,6 +88,11 @@ main = do
             ]
             "repl"
             (pure pgRepl),
+          subcommand
+            [ Opt.progDesc "List tables in a Postgres database."
+            ]
+            "tables"
+            (pure pgTables),
           subcommand
             [ Opt.progDesc "Start a Postgres cluster."
             ]
@@ -215,12 +225,7 @@ pgExplain maybeDatabase queryOrFilename parameters = do
       Text.putStrLn query
       case Aeson.eitherDecodeStrictText @[Analyze] out of
         Left parseError -> Text.putStrLn (Text.pack parseError)
-        Right (head -> analyze) ->
-          analyze
-            & prettyAnalyze
-            & Prettyprinter.layoutPretty (Prettyprinter.LayoutOptions Prettyprinter.Unbounded)
-            & Prettyprinter.Render.Terminal.renderStrict
-            & Text.putStrLn
+        Right (head -> analyze) -> putPretty (prettyAnalyze analyze)
     else do
       Text.putStr out
       Text.putStr err
@@ -281,7 +286,7 @@ pgRepl = do
       [ "--dbname=" <> dbname,
         "--host=" <> host,
         "--port=" <> port,
-        "--username=" <> username,
+        "--pset=null=∅",
         let style x y = "%[%033[" <> Text.intercalate ";" x <> "m%]" <> y <> "%[%033[0m%]"
             blue = "34"
             bold = "1"
@@ -290,7 +295,7 @@ pgRepl = do
             magenta = "35"
             yellow = "33"
          in fold
-              [ "--variable=PROMPT1=",
+              [ "--set=PROMPT1=",
                 "╭ ",
                 style [italic, yellow] "host",
                 " ",
@@ -310,9 +315,63 @@ pgRepl = do
                 "\n╰ ",
                 "%# " -- # (superuser) or > (user)
               ],
-        "--variable=PROMPT2=%w "
+        "--set=PROMPT2=%w ",
+        "--username=" <> username
       ]
   exitWith code
+
+pgTables :: IO ()
+pgTables = do
+  dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
+  host <-
+    resolveValue $
+      Def
+        (TextEnv "PGHOST")
+        ( do
+            stateDir <- getStateDir
+            let clusterDir = stateDir <> "/data"
+            whenNotM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
+              Text.putStrLn ("There's no cluster running at " <> clusterDir)
+              exitFailure
+            pure stateDir
+        )
+  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  let settings =
+        Hasql.settings
+          (Text.encodeUtf8 host)
+          ( case Text.decimal port of
+              Right (port1, "") -> port1
+              _ -> 5432
+          )
+          (Text.encodeUtf8 username)
+          ByteString.empty
+          (Text.encodeUtf8 dbname)
+  result <-
+    bracket
+      (Hasql.acquire settings)
+      \case
+        Left _err -> pure ()
+        Right connection -> Hasql.release connection
+      \case
+        Left err -> pure (Left err)
+        Right connection ->
+          let session = do
+                tables <- Hasql.statement () PgQueries.readTables
+                -- haha n+1 query, but it shouldn't matter
+                columns <- for tables \(oid, _, _, _, _) -> Hasql.statement () (PgQueries.readColumns oid)
+                pure (zip tables columns)
+           in Right <$> Hasql.run session connection
+  result1 <-
+    result & onLeft \connErr -> do
+      Text.putStrLn (maybe "" Text.decodeUtf8 connErr)
+      exitFailure
+  rows <-
+    result1 & onLeft \queryErr -> do
+      Text.putStrLn (Text.pack (show queryErr))
+      exitFailure
+  for_ rows \((_oid, schema, name, tuples, bytes), columns) ->
+    putPretty (prettyTable schema name columns tuples bytes)
 
 pgUp :: IO ()
 pgUp = do
@@ -571,6 +630,10 @@ whenNotM :: (Monad m) => m Bool -> m () -> m ()
 whenNotM mx my = do
   x <- mx
   when (not x) my
+
+onLeft :: (Applicative m) => (a -> m b) -> Either a b -> m b
+onLeft mx =
+  either mx pure
 
 onLeftM :: (Monad m) => (a -> m b) -> m (Either a b) -> m b
 onLeftM mx my =

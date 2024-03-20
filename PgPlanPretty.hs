@@ -8,13 +8,11 @@ import Data.Foldable (fold)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Lazy.Builder qualified as Builder
-import Data.Text.Lazy.Builder.RealFloat qualified as Builder
 import GHC.Float.RealFracMethods (floorDoubleInt, roundDoubleInt)
 import PgPlan
+import PgPrettyUtils
 import Prettyprinter
 import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized)
-import Text.Printf (printf)
 import Prelude hiding (filter)
 
 data Vnode = Vnode
@@ -151,7 +149,7 @@ aggregateVnode info info2 =
     { metadata =
         case info2.peakMemoryUsage of
           Nothing -> []
-          Just mem -> ["Peak memory usage: " <> annBytes (prettyKilobytes mem)],
+          Just mem -> ["Peak memory usage: " <> annBytes (prettyBytes (mem * 1_000))],
       summary =
         case info2.strategy of
           AggregateStrategyHashed ->
@@ -246,7 +244,7 @@ gatherVnode info info2 =
 hashVnode :: Bool -> NodeInfo -> HashNodeInfo -> Vnode
 hashVnode innerUnique info info2 =
   (makeVnode "Hash" info)
-    { metadata = ["Peak memory usage: " <> annBytes (prettyKilobytes info2.peakMemoryUsage)],
+    { metadata = ["Peak memory usage: " <> annBytes (prettyBytes (info2.peakMemoryUsage * 1_000))],
       summary =
         "Build a "
           <> (if innerUnique then "k→v" else "k→vs")
@@ -415,8 +413,8 @@ sortVnode info info2 =
    in vnode
         { metadata =
             [ case info2.sortSpaceType of
-                "Memory" -> "Memory: " <> annBytes (prettyKilobytes info2.sortSpaceUsed)
-                "Disk" -> "Disk: " <> annBytes (prettyKilobytes info2.sortSpaceUsed)
+                "Memory" -> "Memory: " <> annBytes (prettyBytes (info2.sortSpaceUsed * 1_000))
+                "Disk" -> "Disk: " <> annBytes (prettyBytes (info2.sortSpaceUsed * 1_000))
                 ty -> error ("Unknown sort type: " ++ Text.unpack ty)
             ],
           summary =
@@ -462,10 +460,6 @@ prettyAnalyze analyze =
       " to execute)"
     ]
 
-prettyBytes :: Int -> Doc a
-prettyBytes bytes =
-  prettyInt bytes <> if bytes == 1 then " byte" else " bytes"
-
 prettyCost :: Double -> Doc a
 prettyCost cost =
   prettyInt dollars
@@ -476,21 +470,6 @@ prettyCost cost =
     dollars = floorDoubleInt cost
     cents = roundDoubleInt (mod' cost 1 * 100)
 
-prettyDouble :: Int -> Double -> Doc a
-prettyDouble i =
-  pretty . Builder.toLazyText . Builder.formatRealFloat Builder.Fixed (Just i)
-
-prettyInt :: Int -> Doc a
-prettyInt =
-  let loop acc d
-        | d < 1000 = d : acc
-        | otherwise = let (x, y) = divMod d 1000 in loop (y : acc) x
-      pp [] = ""
-      pp (n : ns) = Text.pack (show n) <> pps ns
-      pps = Text.concat . map (("," <>) . pp1)
-      pp1 = Text.pack . printf "%03d" :: Int -> Text
-   in pretty . pp . loop []
-
 prettyJoinType :: JoinType -> Doc a
 prettyJoinType = \case
   AntiJoin -> "Anti"
@@ -500,33 +479,6 @@ prettyJoinType = \case
   RightAntiJoin -> "Right anti"
   RightJoin -> "Right"
   SemiJoin -> "Semi"
-
-prettyKilobytes :: Int -> Doc a
-prettyKilobytes kb
-  | kb < 995 = pretty kb <> " kilobytes"
-  | kb < 9_950 = prettyDouble 2 mb <> " megabytes"
-  | kb < 99_500 = prettyDouble 1 mb <> " megabytes"
-  | kb < 995_000 = prettyDouble 0 mb <> " megabytes"
-  | kb < 9_950_000 = prettyDouble 2 gb <> " gigabytes"
-  | kb < 99_500_000 = prettyDouble 1 gb <> " gigabytes"
-  | otherwise = prettyDouble 0 gb <> " gigabytes"
-  where
-    mb = realToFrac @Int @Double kb / 1_000
-    gb = realToFrac @Int @Double kb / 1_000_000
-
-prettyMilliseconds :: Double -> Doc AnsiStyle
-prettyMilliseconds ms
-  | us < 0.5 = "0 us"
-  | us < 995 = prettyDouble 0 us <> " µs"
-  | us < 9_950 = prettyDouble 2 ms <> " ms"
-  | us < 99_500 = prettyDouble 1 ms <> " ms"
-  | ms < 995 = prettyDouble 0 ms <> " ms"
-  | ms < 9_950 = prettyDouble 2 s <> " s"
-  | ms < 99_500 = prettyDouble 1 s <> " s"
-  | otherwise = prettyDouble 0 s <> " s"
-  where
-    us = ms * 1000
-    s = ms / 1_000
 
 filterLine :: Maybe Text -> Maybe Int -> [Doc AnsiStyle]
 filterLine filter maybeRemoved =
