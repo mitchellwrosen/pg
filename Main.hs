@@ -1,7 +1,8 @@
 module Main (main) where
 
 import Control.Applicative (asum, many)
-import Control.Exception (bracket)
+import Control.Concurrent (threadDelay)
+import Control.Exception (SomeAsyncException (..), SomeException, bracket, fromException, throwIO, try)
 import Control.Monad (when)
 import Data.Aeson qualified as Aeson
 import Data.ByteString qualified as ByteString
@@ -12,11 +13,13 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
+import Network.Socket qualified as Network
 import Options.Applicative (optional)
 import Options.Applicative qualified as Opt
 import PgPlan (Analyze)
 import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
+import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import Prettyprinter qualified
 import Prettyprinter.Render.Terminal qualified
 import System.Directory qualified as Directory
@@ -70,6 +73,11 @@ main = do
                 <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
                 <*> textArg [Opt.metavar "FILENAME"]
             ),
+          subcommand
+            [ Opt.progDesc "Show the logs of the Postgres cluster."
+            ]
+            "logs"
+            (pure pgLogs),
           subcommand
             [ Opt.progDesc "Connect to a Postgres cluster."
             ]
@@ -238,6 +246,18 @@ pgLoad maybeDatabase file = do
     Text.putStr err
     exitWith code
 
+pgLogs :: IO ()
+pgLogs = do
+  stateDir <- getStateDir
+  let clusterDir = stateDir <> "/data"
+  let logFile = stateDir <> "/log.txt"
+  let postmasterFile = clusterDir <> "/postmaster.pid"
+  whenNotM (Directory.doesFileExist (Text.unpack postmasterFile)) do
+    Text.putStrLn ("There's no cluster running at " <> clusterDir)
+    exitFailure
+  Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
+  void (foreground "tail" ["-f", logFile])
+
 pgRepl :: IO ()
 pgRepl = do
   dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
@@ -299,10 +319,11 @@ pgUp = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   let logFile = stateDir <> "/log.txt"
+  let postmasterFile = clusterDir <> "/postmaster.pid"
   whenNotM (Directory.doesDirectoryExist (Text.unpack clusterDir)) do
     Text.putStrLn ("There's no cluster at " <> clusterDir)
     exitFailure
-  whenM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
+  whenM (Directory.doesFileExist (Text.unpack postmasterFile)) do
     Text.putStrLn ("There's already a cluster running at " <> clusterDir)
     exitFailure
   background
@@ -318,8 +339,34 @@ pgUp = do
         ]
     )
     logFile
-  Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
-  void (foreground "tail" ["-f", logFile])
+  bracket (Network.socket Network.AF_UNIX Network.Stream Network.defaultProtocol) Network.close \socket -> do
+    let loop tried maybeUnixSocketAddr
+          | tried >= 5 = do
+              Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
+              logs <- Text.readFile (Text.unpack logFile)
+              Text.putStr logs
+              exitFailure
+          | otherwise = do
+              threadDelay 25_000
+              case maybeUnixSocketAddr of
+                Nothing ->
+                  try @SomeException (Text.readFile (Text.unpack postmasterFile)) >>= \case
+                    Left exception -> do
+                      assertSynchronousException exception
+                      loop (tried + 1) Nothing
+                    Right contents -> do
+                      postmasterPid <-
+                        parsePostmasterPid contents & onNothing do
+                          Text.putStrLn ("Internal error: could not parse contents of file " <> postmasterFile)
+                          exitFailure
+                      let unixSocketFile = postmasterPid.socketDir <> "/.s.PGSQL." <> postmasterPid.port
+                      loop2 tried (Network.SockAddrUnix (Text.unpack unixSocketFile))
+                Just unixSocketAddr -> loop2 tried unixSocketAddr
+        loop2 tried unixSocketAddr =
+          try @SomeException (Network.connect socket unixSocketAddr) & onLeftM \exception -> do
+            assertSynchronousException exception
+            loop (tried + 1) (Just unixSocketAddr)
+    loop (0 :: Int) Nothing
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Cli utils
@@ -507,7 +554,13 @@ getStateDir = do
   pure (Text.pack stateDir <> currentDir)
 
 ------------------------------------------------------------------------------------------------------------------------
--- Misc missing prelude functions
+-- Misc utils and missing prelude functions
+
+assertSynchronousException :: SomeException -> IO ()
+assertSynchronousException exception =
+  case fromException @SomeAsyncException exception of
+    Just _ -> throwIO exception
+    Nothing -> pure ()
 
 whenM :: (Monad m) => m Bool -> m () -> m ()
 whenM mx my = do
@@ -518,6 +571,14 @@ whenNotM :: (Monad m) => m Bool -> m () -> m ()
 whenNotM mx my = do
   x <- mx
   when (not x) my
+
+onLeftM :: (Monad m) => (a -> m b) -> m (Either a b) -> m b
+onLeftM mx my =
+  my >>= either mx pure
+
+onNothing :: (Applicative m) => m a -> Maybe a -> m a
+onNothing mx =
+  maybe mx pure
 
 onNothingM :: (Monad m) => m a -> m (Maybe a) -> m a
 onNothingM mx my =
