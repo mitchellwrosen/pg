@@ -1,6 +1,7 @@
 module PgQueries
   ( GeneratedAsIdentity (..),
     readColumns,
+    ForeignKeyConstraintRow (..),
     readForeignKeyConstraints,
     readTables,
   )
@@ -9,8 +10,9 @@ where
 import Data.Functor ((<&>))
 import Data.Int (Int64)
 import Data.Text (Text)
+import GHC.Generics (Generic)
 import Hasql.Decoders qualified as Decoder
-import Hasql.Interpolate (DecodeValue, decodeValue, interp, sql)
+import Hasql.Interpolate (DecodeRow, DecodeValue, decodeValue, interp, sql)
 import Hasql.Statement (Statement)
 
 data GeneratedAsIdentity
@@ -57,29 +59,45 @@ readColumns oids =
       ORDER BY a.attrelid, a.attnum
     |]
 
-readForeignKeyConstraints ::
-  [Int64] ->
-  Statement
-    ()
-    [ ( Int64, -- referencing table
-        Text, -- constraint name
-        Int64, -- table the constraint refers to
-        Text -- constraint text
-      )
-    ]
+data ForeignKeyConstraintRow = ForeignKeyConstraintRow
+  { constraintName :: !Text,
+    tableOid :: !Int64,
+    columnNames :: ![Text],
+    targetTableOid :: !Int64,
+    targetTableName :: !Text,
+    targetColumnNames :: ![Text],
+    fullText :: !Text
+  }
+  deriving stock (Generic)
+  deriving anyclass (DecodeRow)
+
+readForeignKeyConstraints :: [Int64] -> Statement () [ForeignKeyConstraintRow]
 readForeignKeyConstraints oids =
   interp
     False
     [sql|
       SELECT
-        conrelid :: pg_catalog.int8,
-        conname :: pg_catalog.text,
-        confrelid :: pg_catalog.int8,
+        c.conname :: pg_catalog.text,
+        c.conrelid :: pg_catalog.int8,
+        (
+          SELECT array_agg(a.attname ORDER BY a.attnum)
+          FROM pg_catalog.pg_attribute a
+          WHERE a.attrelid = c.conrelid
+            AND a.attnum = ANY(c.conkey)
+        ),
+        c.confrelid :: pg_catalog.int8,
+        c.confrelid :: pg_catalog.regclass :: pg_catalog.text,
+        (
+          SELECT array_agg(a.attname ORDER BY a.attnum)
+          FROM pg_catalog.pg_attribute a
+          WHERE a.attrelid = c.confrelid
+            AND a.attnum = ANY(c.confkey)
+        ),
         pg_catalog.pg_get_constraintdef(oid, true)
-      FROM pg_catalog.pg_constraint
-      WHERE confrelid = ANY(#{oids})
-        AND contype = 'f'
-      ORDER BY conname;
+      FROM pg_catalog.pg_constraint c
+      WHERE c.confrelid = ANY(#{oids})
+        AND c.contype = 'f'
+      ORDER BY c.conname;
     |]
 
 -- oid, schema, name, type, tuples, bytes

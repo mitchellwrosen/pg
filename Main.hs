@@ -28,7 +28,7 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
-import PgQueries (GeneratedAsIdentity)
+import PgQueries (GeneratedAsIdentity, ForeignKeyConstraintRow)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
 import Queue (Queue)
@@ -393,17 +393,16 @@ pgTables = do
           )
           Map.empty
           columns
-  let foreignKeyConstraints1 :: Map Int64 (Queue (Text, Int64, Text))
+  let foreignKeyConstraints1 :: Map Int64 (Queue ForeignKeyConstraintRow)
       foreignKeyConstraints1 =
         List.foldl'
-          ( \acc (oid, a, b, c) ->
-              let col = (a, b, c)
-               in Map.alter
+          ( \acc row ->
+               Map.alter
                     ( Just . \case
-                        Nothing -> Queue.singleton col
-                        Just cols -> Queue.enqueue col cols
+                        Nothing -> Queue.singleton row
+                        Just rows -> Queue.enqueue row rows
                     )
-                    oid
+                    row.tableOid
                     acc
           )
           Map.empty

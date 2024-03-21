@@ -25,6 +25,7 @@ executable pg
     witch == 1.2.0.4,
   default-extensions:
     BlockArguments
+    DeriveAnyClass
     DerivingStrategies
     DuplicateRecordFields
     GADTs
