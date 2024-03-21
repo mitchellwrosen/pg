@@ -9,12 +9,15 @@ import Data.ByteString qualified as ByteString
 import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
+import Data.Int (Int64)
+import Data.List qualified as List
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
 import Data.Text.Read qualified as Text
-import Data.Traversable (for)
 import Hasql.Connection qualified as Hasql
 import Hasql.Session qualified as Hasql
 import Network.Socket qualified as Network
@@ -25,8 +28,11 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
+import PgQueries (GeneratedAsIdentity)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
+import Queue (Queue)
+import Queue qualified
 import System.Directory qualified as Directory
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -320,6 +326,7 @@ pgRepl = do
       ]
   exitWith code
 
+-- TODO: pg_class relpersistence, relispartition
 pgTables :: IO ()
 pgTables = do
   dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
@@ -358,20 +365,60 @@ pgTables = do
         Right connection ->
           let session = do
                 tables <- Hasql.statement () PgQueries.readTables
-                -- haha n+1 query, but it shouldn't matter
-                columns <- for tables \(oid, _, _, _, _) -> Hasql.statement () (PgQueries.readColumns oid)
-                pure (zip tables columns)
+                let tableOids = map (\(oid, _, _, _, _, _) -> oid) tables
+                columns <- Hasql.statement () (PgQueries.readColumns tableOids)
+                foreignKeyConstraints <- Hasql.statement () (PgQueries.readForeignKeyConstraints tableOids)
+                pure (tables, columns, foreignKeyConstraints)
            in Right <$> Hasql.run session connection
   result1 <-
     result & onLeft \connErr -> do
       Text.putStrLn (maybe "" Text.decodeUtf8 connErr)
       exitFailure
-  rows <-
+  (tables, columns, foreignKeyConstraints) <-
     result1 & onLeft \queryErr -> do
       Text.putStrLn (Text.pack (show queryErr))
       exitFailure
-  for_ rows \((_oid, schema, name, tuples, bytes), columns) ->
-    putPretty (prettyTable schema name columns tuples bytes)
+  let columns1 :: Map Int64 (Queue (Text, Text, GeneratedAsIdentity, Bool, Maybe Text))
+      columns1 =
+        List.foldl'
+          ( \acc (oid, a, b, c, d, e) ->
+              let col = (a, b, c, d, e)
+               in Map.alter
+                    ( Just . \case
+                        Nothing -> Queue.singleton col
+                        Just cols -> Queue.enqueue col cols
+                    )
+                    oid
+                    acc
+          )
+          Map.empty
+          columns
+  let foreignKeyConstraints1 :: Map Int64 (Queue (Text, Int64, Text))
+      foreignKeyConstraints1 =
+        List.foldl'
+          ( \acc (oid, a, b, c) ->
+              let col = (a, b, c)
+               in Map.alter
+                    ( Just . \case
+                        Nothing -> Queue.singleton col
+                        Just cols -> Queue.enqueue col cols
+                    )
+                    oid
+                    acc
+          )
+          Map.empty
+          foreignKeyConstraints
+  for_ tables \((oid, schema, name, maybeType, tuples, bytes)) ->
+    putPretty
+      ( prettyTable
+          schema
+          name
+          maybeType
+          (maybe [] Queue.toList (Map.lookup oid columns1))
+          (maybe [] Queue.toList (Map.lookup oid foreignKeyConstraints1))
+          tuples
+          bytes
+      )
 
 pgUp :: IO ()
 pgUp = do
