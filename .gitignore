@@ -1,3 +1,5 @@
+.direnv/
+.envrc
 Session.vim
 _postgres_clusters/
 dist-newstyle/
