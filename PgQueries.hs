@@ -1,5 +1,6 @@
 module PgQueries
   ( GeneratedAsIdentity (..),
+    OnDelete (..),
     readColumns,
     ForeignKeyConstraintRow (..),
     readForeignKeyConstraints,
@@ -27,6 +28,23 @@ instance DecodeValue GeneratedAsIdentity where
       "a" -> GeneratedAlwaysAsIdentity
       "d" -> GeneratedByDefaultAsIdentity
       _ -> NotGeneratedAsIdentity
+
+data OnDelete
+  = OnDeleteCascade
+  | OnDeleteNoAction
+  | OnDeleteRestrict
+  | OnDeleteSetDefault
+  | OnDeleteSetNull
+
+instance DecodeValue OnDelete where
+  decodeValue :: Decoder.Value OnDelete
+  decodeValue =
+    Decoder.text <&> \case
+      "c" -> OnDeleteCascade
+      "d" -> OnDeleteSetDefault
+      "n" -> OnDeleteSetNull
+      "r" -> OnDeleteRestrict
+      _ -> OnDeleteNoAction
 
 readColumns ::
   [Int64] ->
@@ -66,6 +84,7 @@ data ForeignKeyConstraintRow = ForeignKeyConstraintRow
     targetTableOid :: !Int64,
     targetTableName :: !Text,
     targetColumnNames :: ![Text],
+    onDelete :: !OnDelete,
     fullText :: !Text
   }
   deriving stock (Generic)
@@ -93,6 +112,7 @@ readForeignKeyConstraints oids =
           WHERE a.attrelid = c.confrelid
             AND a.attnum = ANY(c.confkey)
         ),
+        c.confdeltype,
         pg_catalog.pg_get_constraintdef(oid, true)
       FROM pg_catalog.pg_constraint c
       WHERE c.confrelid = ANY(#{oids})

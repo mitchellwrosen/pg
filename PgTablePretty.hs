@@ -12,7 +12,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import PgPrettyUtils (prettyBytes, prettyInt)
-import PgQueries (ForeignKeyConstraintRow (..), GeneratedAsIdentity (..))
+import PgQueries (ForeignKeyConstraintRow (..), GeneratedAsIdentity (..), OnDelete (..))
 import Prettyprinter
 import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized)
 import Queue (Queue)
@@ -23,50 +23,65 @@ prettyColumn ::
   (Text, Text, GeneratedAsIdentity, Bool, Maybe Text) ->
   [ForeignKeyConstraintRow] ->
   [Doc AnsiStyle]
-prettyColumn
-  ( name,
-    typ,
-    generatedAsIdentity,
-    nullable,
-    maybeDefault
-    )
-  foreignKeyConstraints =
-    [ fold
-        [ annotate (color Green) (pretty name),
-          " :: ",
-          annotate
-            (color Yellow <> italicized)
-            (pretty typ <> (if nullable then "?" else mempty)),
-          case (maybeDefault, generatedAsIdentity) of
-            (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
-            (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
-            (_, GeneratedByDefaultAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
-            (_, NotGeneratedAsIdentity) -> mempty
-        ]
-    ]
-      ++ map prettyFK foreignKeyConstraints
-    where
-      prettyFK constraint =
-        "  → " <> prettyConstraintTarget constraint.targetTableName constraint.targetColumnNames
+prettyColumn (name, typ, generatedAsIdentity, nullable, maybeDefault) foreignKeyConstraints =
+  [ fold
+      [ annotate (color Green <> bold) (pretty name),
+        " : ",
+        annotate
+          (color Yellow <> italicized)
+          (pretty (aliasType typ) <> (if nullable then "?" else mempty)),
+        case (maybeDefault, generatedAsIdentity) of
+          (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
+          (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
+          (_, GeneratedByDefaultAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
+          (_, NotGeneratedAsIdentity) -> mempty,
+        case foreignKeyConstraints of
+          [c] -> prettyForeignKeyConstraint False c
+          _ -> mempty
+      ]
+  ]
+    ++ case foreignKeyConstraints of
+      [_] -> [] -- rendered it inline above
+      _ -> map (\c -> " " <> prettyForeignKeyConstraint False c) foreignKeyConstraints
+  where
+    -- prettify the types a bit
+    aliasType :: Text -> Text
+    aliasType = \case
+      "bigint" -> "int8"
+      "bigserial" -> "serial8"
+      "bit varying" -> "varbit"
+      "boolean" -> "bool"
+      "character varying" -> "varchar"
+      "character" -> "char"
+      "double precision" -> "float8"
+      "integer" -> "int4"
+      "numeric" -> "decimal"
+      "real" -> "float4"
+      "serial" -> "serial4"
+      "time with time zone" -> "timetz"
+      "time without time zone" -> "time"
+      "timestamp with time zone" -> "timestamptz"
+      "timestamp without time zone" -> "timestamp"
+      t -> t
 
-prettyConstraintSource :: [Text] -> Doc AnsiStyle
-prettyConstraintSource =
-  annotate (colorDull Green) . pretty . Text.intercalate ","
-
-prettyConstraintTarget :: (Pretty a) => a -> [Text] -> Doc AnsiStyle
-prettyConstraintTarget table columns =
+prettyForeignKeyConstraint :: Bool -> ForeignKeyConstraintRow -> Doc AnsiStyle
+prettyForeignKeyConstraint showSource row =
   fold
-    [ annotate (colorDull Green) (pretty table <> "."),
-      prettyConstraintSource columns
-    ]
-
-prettyForeignKeyConstraint :: ForeignKeyConstraintRow -> Doc AnsiStyle
-prettyForeignKeyConstraint row =
-  fold
-    [ prettyConstraintSource row.columnNames,
+    [ if showSource then prettyConstraintSource row.columnNames else mempty,
       " → ",
-      prettyConstraintTarget row.targetTableName row.targetColumnNames
+      annotate (colorDull Green) (pretty row.targetTableName <> "."),
+      prettyConstraintSource row.targetColumnNames,
+      case row.onDelete of
+        OnDeleteCascade -> annotate italicized " on delete cascade"
+        OnDeleteNoAction -> mempty
+        OnDeleteRestrict -> mempty
+        OnDeleteSetDefault -> annotate italicized " on delete set default"
+        OnDeleteSetNull -> annotate italicized " on delete set null"
     ]
+  where
+    prettyConstraintSource :: [Text] -> Doc AnsiStyle
+    prettyConstraintSource =
+      annotate (colorDull Green) . pretty . Text.intercalate ","
 
 prettyTable ::
   Text ->
@@ -100,7 +115,7 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
         )
         columns,
       foldMap
-        (\c -> line <> "│  " <> prettyForeignKeyConstraint c)
+        (\c -> line <> "│  " <> prettyForeignKeyConstraint True c)
         ( -- Filter out single-column foreign keys because we show them with the column, not at the bottom
           foreignKeyConstraints & filter \constraint ->
             case constraint.columnNames of
