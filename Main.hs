@@ -28,9 +28,10 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
-import PgQueries (GeneratedAsIdentity, ForeignKeyConstraintRow)
+import PgQueries (ForeignKeyConstraintRow, GeneratedAsIdentity)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
+import Prettyprinter qualified
 import Queue (Queue)
 import Queue qualified
 import System.Directory qualified as Directory
@@ -49,7 +50,26 @@ main = do
     [ Opt.showHelpOnEmpty,
       Opt.showHelpOnError
     ]
-    [ Opt.progDesc "Postgres utility knife."
+    [ Opt.progDescDoc $
+        Just $
+          fold
+            [ Prettyprinter.pretty @Text "Postgres utility knife.",
+              Prettyprinter.line,
+              Prettyprinter.line,
+              Prettyprinter.pretty @Text "The following environment variables may affect behavior:",
+              Prettyprinter.line,
+              Prettyprinter.line,
+              Prettyprinter.indent 2 $
+                fold
+                  [ Prettyprinter.pretty @Text "PGDATABASE",
+                    Prettyprinter.line,
+                    Prettyprinter.pretty @Text "PGHOST",
+                    Prettyprinter.line,
+                    Prettyprinter.pretty @Text "PGPORT",
+                    Prettyprinter.line,
+                    Prettyprinter.pretty @Text "PGUSER"
+                  ]
+            ]
     ]
     [ subcommands
         [ subcommand
@@ -272,12 +292,12 @@ pgLogs = do
 pgRepl :: IO ()
 pgRepl = do
   dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
+  stateDir <- getStateDir
   host <-
     resolveValue $
       Def
         (TextEnv "PGHOST")
         ( do
-            stateDir <- getStateDir
             let clusterDir = stateDir <> "/data"
             whenNotM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
               Text.putStrLn ("There's no cluster running at " <> clusterDir)
@@ -303,10 +323,15 @@ pgRepl = do
          in fold
               [ "--set=PROMPT1=",
                 "╭ ",
-                style [italic, yellow] "host",
-                " ",
-                style [bold, yellow] "%M",
-                "\n│ ",
+                if host == stateDir
+                  then mempty
+                  else
+                    fold
+                      [ style [italic, yellow] "host",
+                        " ",
+                        style [bold, yellow] "%M",
+                        "\n│ "
+                      ],
                 style [italic, green] "port",
                 " ",
                 style [bold, green] "%>",
@@ -397,13 +422,13 @@ pgTables = do
       foreignKeyConstraints1 =
         List.foldl'
           ( \acc row ->
-               Map.alter
-                    ( Just . \case
-                        Nothing -> Queue.singleton row
-                        Just rows -> Queue.enqueue row rows
-                    )
-                    row.tableOid
-                    acc
+              Map.alter
+                ( Just . \case
+                    Nothing -> Queue.singleton row
+                    Just rows -> Queue.enqueue row rows
+                )
+                row.tableOid
+                acc
           )
           Map.empty
           foreignKeyConstraints
