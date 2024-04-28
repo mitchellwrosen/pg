@@ -15,6 +15,7 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Text.Builder.Linear qualified as Text.Builder
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
 import Data.Text.Read qualified as Text
@@ -114,6 +115,52 @@ main = do
             ]
             "repl"
             (pure pgRepl),
+          subcommand
+            [ Opt.progDesc "Print the syntax of Postgres DDL."
+            ]
+            "syntax"
+            ( subcommands
+                [ subcommand
+                    [ Opt.progDesc "Create an index."
+                    ]
+                    "create-index"
+                    ( pgSyntaxCreateIndex
+                        <$> Opt.switch
+                          ( Opt.help "Build index without preventing concurrent writes."
+                              <> Opt.long "concurrently"
+                          )
+                        <*> textOpt
+                          [ Opt.help "Index name, and do nothing if index with same name already exists (incompatible with --name).",
+                            Opt.long "if-not-exists",
+                            Opt.metavar "NAME"
+                          ]
+                        <*> many
+                          ( Opt.strOption
+                              ( Opt.help "Include non-key column in index."
+                                  <> Opt.long "include"
+                                  <> Opt.metavar "COLUMN"
+                              )
+                          )
+                        <*> textOpt
+                          [ Opt.help "Index name (incompatible with --if-not-exists).",
+                            Opt.long "name",
+                            Opt.metavar "NAME"
+                          ]
+                        <*> Opt.switch
+                          ( Opt.help "Don't recurse creating indexes on partitions, if table is partitioned."
+                              <> Opt.long "only"
+                          )
+                        <*> textOpt [Opt.help "Table name.", Opt.long "table", Opt.metavar "TABLE"]
+                        <*> Opt.switch (Opt.help "Prevent duplicate values in index, allowing duplicate NULL values (incompatible with --unique-nulls-not-distinct)." <> Opt.long "unique")
+                        <*> Opt.switch (Opt.help "Prevent duplicate values in index, disallowing duplicate NULL values (incompatible with --unique)." <> Opt.long "unique-nulls-not-distinct")
+                        <*> textOpt
+                          [ Opt.help "Index method (btree, hash, gist, spgist, bin, brin, or user-installed method)",
+                            Opt.long "using",
+                            Opt.metavar "METHOD"
+                          ]
+                    )
+                ]
+            ),
           subcommand
             [ Opt.progDesc "List tables in a Postgres database."
             ]
@@ -350,6 +397,37 @@ pgRepl = do
         "--username=" <> username
       ]
   exitWith code
+
+pgSyntaxCreateIndex :: Bool -> Maybe Text -> [Text] -> Maybe Text -> Bool -> Maybe Text -> Bool -> Bool -> Maybe Text -> IO ()
+pgSyntaxCreateIndex concurrently maybeIfNotExists include maybeName only maybeTable unique uniqueNullsNotDistinct maybeUsing = do
+  case (maybeIfNotExists, maybeName) of
+    (Just _, Just _) -> do
+      Text.putStrLn "--if-not-exists and --name are incompatible."
+      exitFailure
+    _ -> pure ()
+  case (unique, uniqueNullsNotDistinct) of
+    (True, True) -> do
+      Text.putStrLn "--unique and --unique-nulls-not-distinct are incompatible."
+      exitFailure
+    _ -> pure ()
+  Text.putStrLn . Text.Builder.runBuilder . fold $
+    [ "CREATE ",
+      if unique || uniqueNullsNotDistinct then "UNIQUE " else mempty,
+      "INDEX ",
+      if concurrently then "CONCURRENTLY " else mempty,
+      maybe mempty (("IF NOT EXISTS " <>) . Text.Builder.fromText) maybeIfNotExists,
+      maybe mempty ((" " <>) . Text.Builder.fromText) maybeName,
+      "ON ",
+      if only then "ONLY " else mempty,
+      maybe "«table»" Text.Builder.fromText maybeTable,
+      " ",
+      maybe "USING btree " (\method -> "USING " <> Text.Builder.fromText method <> " ") maybeUsing,
+      "(«column», «expression», ...) ",
+      case include of
+        [] -> mempty
+        _ -> "INCLUDE (" <> fold (List.intersperse ", " (map Text.Builder.fromText include)) <> ") ",
+      if unique then "NULLS DISTINCT " else if uniqueNullsNotDistinct then "NULLS NOT DISTINCT " else mempty
+    ]
 
 -- TODO: pg_class relpersistence, relispartition
 pgTables :: IO ()
