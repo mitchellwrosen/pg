@@ -416,7 +416,7 @@ pgSyntaxCreateIndex concurrently maybeIfNotExists include maybeName only maybeTa
       "INDEX ",
       if concurrently then "CONCURRENTLY " else mempty,
       maybe mempty (("IF NOT EXISTS " <>) . Text.Builder.fromText) maybeIfNotExists,
-      maybe mempty ((" " <>) . Text.Builder.fromText) maybeName,
+      maybe mempty ((<> " ") . Text.Builder.fromText) maybeName,
       "ON ",
       if only then "ONLY " else mempty,
       maybe "«table»" Text.Builder.fromText maybeTable,
