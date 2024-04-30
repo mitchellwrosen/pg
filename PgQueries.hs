@@ -1,9 +1,13 @@
 module PgQueries
   ( GeneratedAsIdentity (..),
+    Oid,
     OnDelete (..),
     readColumns,
     ForeignKeyConstraintRow (..),
     readForeignKeyConstraints,
+    IndexRow (..),
+    readIndexes,
+    TableRow (..),
     readTables,
   )
 where
@@ -29,6 +33,9 @@ instance DecodeValue GeneratedAsIdentity where
       "d" -> GeneratedByDefaultAsIdentity
       _ -> NotGeneratedAsIdentity
 
+type Oid =
+  Int64
+
 data OnDelete
   = OnDeleteCascade
   | OnDeleteNoAction
@@ -47,10 +54,10 @@ instance DecodeValue OnDelete where
       _ -> OnDeleteNoAction
 
 readColumns ::
-  [Int64] ->
+  [Oid] ->
   Statement
     ()
-    [ ( Int64, -- table oid
+    [ ( Oid, -- table oid
         Text, -- name
         Text, -- type
         GeneratedAsIdentity,
@@ -70,7 +77,7 @@ readColumns oids =
         NOT a.attnotnull,
         pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)
       FROM pg_catalog.pg_attribute AS a
-      LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum AND a.atthasdef
+        LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum AND a.atthasdef
       WHERE a.attrelid = ANY(#{oids})
         AND a.attnum > 0
         AND NOT a.attisdropped
@@ -79,9 +86,9 @@ readColumns oids =
 
 data ForeignKeyConstraintRow = ForeignKeyConstraintRow
   { constraintName :: !Text,
-    tableOid :: !Int64,
+    tableOid :: !Oid,
     columnNames :: ![Text],
-    targetTableOid :: !Int64,
+    targetTableOid :: !Oid,
     targetTableName :: !Text,
     targetColumnNames :: ![Text],
     onDelete :: !OnDelete,
@@ -90,7 +97,7 @@ data ForeignKeyConstraintRow = ForeignKeyConstraintRow
   deriving stock (Generic)
   deriving anyclass (DecodeRow)
 
-readForeignKeyConstraints :: [Int64] -> Statement () [ForeignKeyConstraintRow]
+readForeignKeyConstraints :: [Oid] -> Statement () [ForeignKeyConstraintRow]
 readForeignKeyConstraints oids =
   interp
     False
@@ -120,8 +127,40 @@ readForeignKeyConstraints oids =
       ORDER BY c.conname;
     |]
 
+data IndexRow = IndexRow
+  { tableOid :: !Oid,
+    indexName :: !Text
+  }
+  deriving stock (Generic)
+  deriving anyclass (DecodeRow)
+
+readIndexes :: [Oid] -> Statement () [IndexRow]
+readIndexes oids =
+  interp
+    False
+    [sql|
+      SELECT
+        c1.oid :: pg_catalog.int8,
+        c2.relname :: pg_catalog.text
+      FROM pg_catalog.pg_class AS c1
+        JOIN pg_catalog.pg_index AS i ON c1.oid = i.indrelid
+        JOIN pg_catalog.pg_class AS c2 ON i.indexrelid = c2.oid
+      WHERE c1.oid = ANY(#{oids})
+    |]
+
+data TableRow = TableRow
+  { oid :: !Oid,
+    schema :: !Text,
+    name :: !Text,
+    type_ :: !(Maybe Text),
+    tuples :: !Float,
+    bytes :: !Int64
+  }
+  deriving stock (Generic)
+  deriving anyclass (DecodeRow)
+
 -- oid, schema, name, type, tuples, bytes
-readTables :: Statement () [(Int64, Text, Text, Maybe Text, Float, Int64)]
+readTables :: Statement () [TableRow]
 readTables =
   interp
     False
@@ -138,7 +177,7 @@ readTables =
         c.reltuples,
         (c.relpages :: pg_catalog.int8) * (current_setting('block_size') :: pg_catalog.int8)
       FROM pg_catalog.pg_class AS c
-      JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+        JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
       WHERE c.relkind = 'r'
         AND n.nspname != 'information_schema'
         AND n.nspname != 'pg_catalog'

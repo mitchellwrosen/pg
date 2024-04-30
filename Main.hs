@@ -9,7 +9,6 @@ import Data.ByteString qualified as ByteString
 import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
-import Data.Int (Int64)
 import Data.List qualified as List
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -29,7 +28,7 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
-import PgQueries (ForeignKeyConstraintRow, GeneratedAsIdentity)
+import PgQueries (ForeignKeyConstraintRow, GeneratedAsIdentity, IndexRow)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
 import Prettyprinter qualified
@@ -468,20 +467,21 @@ pgTables = do
         Right connection ->
           let session = do
                 tables <- Hasql.statement () PgQueries.readTables
-                let tableOids = map (\(oid, _, _, _, _, _) -> oid) tables
+                let tableOids = map (.oid) tables
                 columns <- Hasql.statement () (PgQueries.readColumns tableOids)
                 foreignKeyConstraints <- Hasql.statement () (PgQueries.readForeignKeyConstraints tableOids)
-                pure (tables, columns, foreignKeyConstraints)
+                indexes <- Hasql.statement () (PgQueries.readIndexes tableOids)
+                pure (tables, columns, foreignKeyConstraints, indexes)
            in Right <$> Hasql.run session connection
   result1 <-
     result & onLeft \connErr -> do
       Text.putStrLn (maybe "" Text.decodeUtf8 connErr)
       exitFailure
-  (tables, columns, foreignKeyConstraints) <-
+  (tables, columns, foreignKeyConstraints, indexes) <-
     result1 & onLeft \queryErr -> do
       Text.putStrLn (Text.pack (show queryErr))
       exitFailure
-  let columns1 :: Map Int64 (Queue (Text, Text, GeneratedAsIdentity, Bool, Maybe Text))
+  let columns1 :: Map PgQueries.Oid (Queue (Text, Text, GeneratedAsIdentity, Bool, Maybe Text))
       columns1 =
         List.foldl'
           ( \acc (oid, a, b, c, d, e) ->
@@ -496,31 +496,29 @@ pgTables = do
           )
           Map.empty
           columns
-  let foreignKeyConstraints1 :: Map Int64 (Queue ForeignKeyConstraintRow)
+  let foreignKeyConstraints1 :: Map PgQueries.Oid (Queue ForeignKeyConstraintRow)
       foreignKeyConstraints1 =
         List.foldl'
-          ( \acc row ->
-              Map.alter
-                ( Just . \case
-                    Nothing -> Queue.singleton row
-                    Just rows -> Queue.enqueue row rows
-                )
-                row.tableOid
-                acc
-          )
+          (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
           Map.empty
           foreignKeyConstraints
-  for_ tables \((oid, schema, name, maybeType, tuples, bytes)) ->
-    putPretty
-      ( prettyTable
-          schema
-          name
-          maybeType
-          (maybe [] Queue.toList (Map.lookup oid columns1))
-          (maybe [] Queue.toList (Map.lookup oid foreignKeyConstraints1))
-          tuples
-          bytes
-      )
+  let indexes1 :: Map PgQueries.Oid (Queue IndexRow)
+      indexes1 =
+        List.foldl'
+          (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
+          Map.empty
+          indexes
+  for_ tables \table ->
+    putPretty $
+      prettyTable
+        table.schema
+        table.name
+        table.type_
+        (maybe [] Queue.toList (Map.lookup table.oid columns1))
+        (maybe [] Queue.toList (Map.lookup table.oid foreignKeyConstraints1))
+        table.tuples
+        table.bytes
+        (maybe [] Queue.toList (Map.lookup table.oid indexes1))
 
 pgUp :: IO ()
 pgUp = do

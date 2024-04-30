@@ -12,7 +12,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import PgPrettyUtils (prettyBytes, prettyInt)
-import PgQueries (ForeignKeyConstraintRow (..), GeneratedAsIdentity (..), OnDelete (..))
+import PgQueries (ForeignKeyConstraintRow (..), GeneratedAsIdentity (..), IndexRow (..), OnDelete (..))
 import Prettyprinter
 import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized)
 import Queue (Queue)
@@ -91,8 +91,9 @@ prettyTable ::
   [ForeignKeyConstraintRow] ->
   Float ->
   Int64 ->
+  [IndexRow] ->
   Doc AnsiStyle
-prettyTable schema tableName maybeType columns foreignKeyConstraints tuples bytes =
+prettyTable schema tableName maybeType columns foreignKeyConstraints tuples bytes indexes =
   fold
     [ "╭─",
       line,
@@ -135,6 +136,17 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
             ]
         else mempty,
       line,
+      foldMap
+        ( \i ->
+            fold
+              [ "│",
+                line,
+                "│",
+                pretty i.indexName,
+                line
+              ]
+        )
+        indexes,
       "╰─"
     ]
   where
