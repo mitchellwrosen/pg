@@ -101,9 +101,12 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
         Nothing -> mempty
         Just typ -> " :: " <> annotate (color Yellow <> italicized) (pretty typ),
       columns & foldMap \column ->
-        foldMap
-          (\doc -> line <> "│  " <> doc)
-          (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
+        if column.dropped
+          then mempty
+          else
+            foldMap
+              (\doc -> line <> "│  " <> doc)
+              (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
       foldMap
         (\c -> line <> "│  " <> prettyForeignKeyConstraint True c)
         ( -- Filter out single-column foreign keys because we show them with the column, not at the bottom

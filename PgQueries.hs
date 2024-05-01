@@ -60,7 +60,11 @@ data ColumnRow = ColumnRow
     type_ :: !Text,
     generatedAsIdentity :: !GeneratedAsIdentity,
     nullable :: !Bool,
-    default_ :: !(Maybe Text)
+    default_ :: !(Maybe Text),
+    -- we read this column out too rather than filter them out with a WHERE clause because the pg_index table refers to
+    -- columns by their index offset (never pointing directly to a dropped column, of course, but we need the accurate
+    -- offset nonetheless)
+    dropped :: !Bool
   }
   deriving stock (Generic)
   deriving anyclass (DecodeRow)
@@ -76,12 +80,12 @@ readColumns oids =
         pg_catalog.format_type(a.atttypid, a.atttypmod),
         a.attidentity,
         NOT a.attnotnull,
-        pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)
+        pg_catalog.pg_get_expr(d.adbin, d.adrelid, true),
+        a.attisdropped
       FROM pg_catalog.pg_attribute AS a
         LEFT JOIN pg_catalog.pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum AND a.atthasdef
       WHERE a.attrelid = ANY(#{oids})
         AND a.attnum > 0
-        AND NOT a.attisdropped
       ORDER BY a.attrelid, a.attnum
     |]
 
