@@ -5,32 +5,31 @@ where
 
 import Data.Foldable (fold)
 import Data.Function ((&))
-import Data.Int (Int64)
+import Data.Int (Int16, Int64)
 import Data.List qualified as List
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.Vector (Vector)
+import Data.Vector qualified as Vector
 import PgPrettyUtils (prettyBytes, prettyInt)
-import PgQueries (ForeignKeyConstraintRow (..), GeneratedAsIdentity (..), IndexRow (..), OnDelete (..))
-import Prettyprinter
+import PgQueries (ColumnRow (..), ForeignKeyConstraintRow (..), GeneratedAsIdentity (..), IndexRow (..), OnDelete (..))
+import Prettyprinter hiding (column)
 import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized)
 import Queue (Queue)
 import Queue qualified
 import Witch (unsafeInto)
 
-prettyColumn ::
-  (Text, Text, GeneratedAsIdentity, Bool, Maybe Text) ->
-  [ForeignKeyConstraintRow] ->
-  [Doc AnsiStyle]
-prettyColumn (name, typ, generatedAsIdentity, nullable, maybeDefault) foreignKeyConstraints =
+prettyColumn :: ColumnRow -> [ForeignKeyConstraintRow] -> [Doc AnsiStyle]
+prettyColumn row {-(name, typ, generatedAsIdentity, nullable, maybeDefault)-} foreignKeyConstraints =
   [ fold
-      [ annotate (color Green <> bold) (pretty name),
+      [ annotate (color Green <> bold) (pretty row.name),
         " : ",
         annotate
           (color Yellow <> italicized)
-          (pretty (aliasType typ) <> (if nullable then "?" else mempty)),
-        case (maybeDefault, generatedAsIdentity) of
+          (pretty (aliasType row.type_) <> (if row.nullable then "?" else mempty)),
+        case (row.default_, row.generatedAsIdentity) of
           (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
           (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
           (_, GeneratedByDefaultAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
@@ -87,7 +86,7 @@ prettyTable ::
   Text ->
   Text ->
   Maybe Text ->
-  [(Text, Text, GeneratedAsIdentity, Bool, Maybe Text)] ->
+  Vector ColumnRow ->
   [ForeignKeyConstraintRow] ->
   Float ->
   Int64 ->
@@ -101,20 +100,10 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
       case maybeType of
         Nothing -> mempty
         Just typ -> " :: " <> annotate (color Yellow <> italicized) (pretty typ),
-      foldMap
-        ( \col@(name, _, _, _, _) ->
-            foldMap
-              (\doc -> line <> "│  " <> doc)
-              ( prettyColumn
-                  col
-                  ( maybe
-                      []
-                      Queue.toList
-                      (Map.lookup name foreignKeyConstraints1)
-                  )
-              )
-        )
-        columns,
+      columns & foldMap \column ->
+        foldMap
+          (\doc -> line <> "│  " <> doc)
+          (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
       foldMap
         (\c -> line <> "│  " <> prettyForeignKeyConstraint True c)
         ( -- Filter out single-column foreign keys because we show them with the column, not at the bottom
@@ -136,17 +125,43 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
             ]
         else mempty,
       line,
-      foldMap
-        ( \i ->
-            fold
+      if null indexes then mempty else "│" <> line,
+      indexes & foldMap \index ->
+        let columnIndexToPrettyColumn i =
+              let column = columns Vector.! fromIntegral @Int16 @Int (i - 1)
+               in annotate (color Green) (pretty column.name)
+         in fold
               [ "│",
-                line,
-                "│",
-                pretty i.indexName,
+                let things =
+                      index.columnIndexes
+                        & take (fromIntegral @Int16 @Int index.numKeyColumns)
+                        & map
+                          ( \i ->
+                              if i == 0
+                                then Nothing
+                                else Just (columnIndexToPrettyColumn i)
+                          )
+                        -- Splitting expressions on ", " isn't perfect, because an expression can of course have a
+                        -- comma+space in it (e.g. a string literal), but that seems unlikely, so I don't want to invest
+                        -- more effort in this at the moment. I could not find a way to return the expressions in an array
+                        -- rather than a text - it seems our two options are do-or-do-not pass the column to pg_get_expr.
+                        & fillHoles
+                          "«bug»"
+                          ( maybe
+                              []
+                              (map (annotate (color Magenta) . pretty) . Text.splitOn ", ")
+                              index.expressions
+                          )
+                 in "  ∙ " <> fold (punctuate ", " things),
+                if index.isUnique then " unique" else mempty,
+                case index.predicate of
+                  Nothing -> mempty
+                  Just predicate -> " where " <> annotate (color Magenta) (pretty predicate),
+                case drop (fromIntegral @Int16 @Int index.numKeyColumns) index.columnIndexes of
+                  [] -> mempty
+                  is -> " → " <> fold (punctuate ", " (map columnIndexToPrettyColumn is)),
                 line
-              ]
-        )
-        indexes,
+              ],
       "╰─"
     ]
   where
@@ -155,15 +170,23 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
       List.foldl'
         ( \acc row ->
             case row.columnNames of
-              [name] ->
-                Map.alter
-                  ( Just . \case
-                      Nothing -> Queue.singleton row
-                      Just rows -> Queue.enqueue row rows
-                  )
-                  name
-                  acc
+              [name] -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) name acc
               _ -> acc
         )
         Map.empty
         foreignKeyConstraints
+
+-- `fillHoles def dirt xs` plugs each `Nothing` in `xs` with a value from `dirt`, and if/when `dirt` runs out, starts
+-- plugging with `def` instead.
+--
+-- >>> fillHoles 0 [1,2,3] [Nothing, Nothing, Just 10, Nothing, Nothing, Nothing]
+-- [1,2,10,3,0,0]
+fillHoles :: forall a. a -> [a] -> [Maybe a] -> [a]
+fillHoles def =
+  go Queue.empty
+  where
+    go :: Queue a -> [a] -> [Maybe a] -> [a]
+    go acc _ [] = Queue.toList acc
+    go acc ys (Just x : xs) = go (Queue.enqueue x acc) ys xs
+    go acc (y : ys) (Nothing : xs) = go (Queue.enqueue y acc) ys xs
+    go acc [] (Nothing : xs) = go (Queue.enqueue def acc) (repeat def) xs

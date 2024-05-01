@@ -18,6 +18,7 @@ import Data.Text.Builder.Linear qualified as Text.Builder
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
 import Data.Text.Read qualified as Text
+import Data.Vector qualified as Vector
 import Hasql.Connection qualified as Hasql
 import Hasql.Session qualified as Hasql
 import Network.Socket qualified as Network
@@ -28,7 +29,7 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
-import PgQueries (ForeignKeyConstraintRow, GeneratedAsIdentity, IndexRow)
+import PgQueries (ColumnRow, ForeignKeyConstraintRow, IndexRow, Oid)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
 import Prettyprinter qualified
@@ -481,28 +482,19 @@ pgTables = do
     result1 & onLeft \queryErr -> do
       Text.putStrLn (Text.pack (show queryErr))
       exitFailure
-  let columns1 :: Map PgQueries.Oid (Queue (Text, Text, GeneratedAsIdentity, Bool, Maybe Text))
+  let columns1 :: Map Oid (Queue ColumnRow)
       columns1 =
         List.foldl'
-          ( \acc (oid, a, b, c, d, e) ->
-              let col = (a, b, c, d, e)
-               in Map.alter
-                    ( Just . \case
-                        Nothing -> Queue.singleton col
-                        Just cols -> Queue.enqueue col cols
-                    )
-                    oid
-                    acc
-          )
+          (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
           Map.empty
           columns
-  let foreignKeyConstraints1 :: Map PgQueries.Oid (Queue ForeignKeyConstraintRow)
+  let foreignKeyConstraints1 :: Map Oid (Queue ForeignKeyConstraintRow)
       foreignKeyConstraints1 =
         List.foldl'
           (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
           Map.empty
           foreignKeyConstraints
-  let indexes1 :: Map PgQueries.Oid (Queue IndexRow)
+  let indexes1 :: Map Oid (Queue IndexRow)
       indexes1 =
         List.foldl'
           (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
@@ -514,7 +506,7 @@ pgTables = do
         table.schema
         table.name
         table.type_
-        (maybe [] Queue.toList (Map.lookup table.oid columns1))
+        (maybe Vector.empty (Vector.fromList . Queue.toList) (Map.lookup table.oid columns1))
         (maybe [] Queue.toList (Map.lookup table.oid foreignKeyConstraints1))
         table.tuples
         table.bytes

@@ -2,6 +2,7 @@ module PgQueries
   ( GeneratedAsIdentity (..),
     Oid,
     OnDelete (..),
+    ColumnRow (..),
     readColumns,
     ForeignKeyConstraintRow (..),
     readForeignKeyConstraints,
@@ -13,7 +14,7 @@ module PgQueries
 where
 
 import Data.Functor ((<&>))
-import Data.Int (Int64)
+import Data.Int (Int16, Int64)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 import Hasql.Decoders qualified as Decoder
@@ -53,18 +54,18 @@ instance DecodeValue OnDelete where
       "r" -> OnDeleteRestrict
       _ -> OnDeleteNoAction
 
-readColumns ::
-  [Oid] ->
-  Statement
-    ()
-    [ ( Oid, -- table oid
-        Text, -- name
-        Text, -- type
-        GeneratedAsIdentity,
-        Bool, -- nullable?
-        Maybe Text -- default value
-      )
-    ]
+data ColumnRow = ColumnRow
+  { tableOid :: !Oid,
+    name :: !Text,
+    type_ :: !Text,
+    generatedAsIdentity :: !GeneratedAsIdentity,
+    nullable :: !Bool,
+    default_ :: !(Maybe Text)
+  }
+  deriving stock (Generic)
+  deriving anyclass (DecodeRow)
+
+readColumns :: [Oid] -> Statement () [ColumnRow]
 readColumns oids =
   interp
     False
@@ -129,7 +130,12 @@ readForeignKeyConstraints oids =
 
 data IndexRow = IndexRow
   { tableOid :: !Oid,
-    indexName :: !Text
+    indexName :: !Text,
+    isUnique :: !Bool,
+    columnIndexes :: ![Int16],
+    numKeyColumns :: !Int16,
+    expressions :: !(Maybe Text),
+    predicate :: !(Maybe Text)
   }
   deriving stock (Generic)
   deriving anyclass (DecodeRow)
@@ -141,7 +147,12 @@ readIndexes oids =
     [sql|
       SELECT
         c1.oid :: pg_catalog.int8,
-        c2.relname :: pg_catalog.text
+        c2.relname :: pg_catalog.text,
+        i.indisunique,
+        i.indkey :: pg_catalog.int2[],
+        i.indnkeyatts,
+        pg_catalog.pg_get_expr(i.indexprs, c1.oid, true) :: pg_catalog.text,
+        pg_catalog.pg_get_expr(i.indpred, c1.oid, true) :: pg_catalog.text
       FROM pg_catalog.pg_class AS c1
         JOIN pg_catalog.pg_index AS i ON c1.oid = i.indrelid
         JOIN pg_catalog.pg_class AS c2 ON i.indexrelid = c2.oid
