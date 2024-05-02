@@ -10,9 +10,6 @@ import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
 import Data.List qualified as List
-import Data.Map.Strict (Map)
-import PgUtils (rowsByKey)
-import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -31,12 +28,10 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
-import PgQueries (CheckConstraintRow, ColumnRow, ForeignKeyConstraintRow, IndexRow, Oid)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
+import PgUtils (rowsByKey)
 import Prettyprinter qualified
-import Queue (Queue)
-import Queue qualified
 import System.Directory qualified as Directory
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -473,20 +468,22 @@ pgTables = do
                 let tableOids = map (.oid) tables
                 columns <- Hasql.statement () (PgQueries.readColumns tableOids)
                 foreignKeyConstraints <- Hasql.statement () (PgQueries.readForeignKeyConstraints tableOids)
+                incomingForeignKeyConstraints <- Hasql.statement () (PgQueries.readIncomingForeignKeyConstraints tableOids)
                 checkConstraints <- Hasql.statement () (PgQueries.readCheckConstraints tableOids)
                 indexes <- Hasql.statement () (PgQueries.readIndexes tableOids)
-                pure (tables, columns, foreignKeyConstraints, checkConstraints, indexes)
+                pure (tables, columns, foreignKeyConstraints, incomingForeignKeyConstraints, checkConstraints, indexes)
            in Right <$> Hasql.run session connection
   result1 <-
     result & onLeft \connErr -> do
       Text.putStrLn (maybe "" Text.decodeUtf8 connErr)
       exitFailure
-  (tables, columns, foreignKeyConstraints, checkConstraints, indexes) <-
+  (tables, columns, foreignKeyConstraints, incomingForeignKeyConstraints, checkConstraints, indexes) <-
     result1 & onLeft \queryErr -> do
       Text.putStrLn (Text.pack (show queryErr))
       exitFailure
   let getColumns = rowsByKey (.tableOid) columns
-  let getForeignKeyConstraints = rowsByKey (.tableOid) foreignKeyConstraints
+  let getForeignKeyConstraints = rowsByKey (.sourceTableOid) foreignKeyConstraints
+  let getIncomingForeignKeyConstraints = rowsByKey (.targetTableOid) incomingForeignKeyConstraints
   let getCheckConstraints = rowsByKey (.tableOid) checkConstraints
   let getIndexes = rowsByKey (.tableOid) indexes
   for_ tables \table ->
@@ -495,6 +492,7 @@ pgTables = do
         table
         (Vector.fromList (getColumns table.oid))
         (getForeignKeyConstraints table.oid)
+        (getIncomingForeignKeyConstraints table.oid)
         (getCheckConstraints table.oid)
         (getIndexes table.oid)
 

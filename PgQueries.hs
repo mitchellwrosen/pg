@@ -9,6 +9,7 @@ module PgQueries
     readColumns,
     ForeignKeyConstraintRow (..),
     readForeignKeyConstraints,
+    readIncomingForeignKeyConstraints,
     IndexRow (..),
     readIndexes,
     TableRow (..),
@@ -21,7 +22,7 @@ import Data.Int (Int16, Int64)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 import Hasql.Decoders qualified as Decoder
-import Hasql.Interpolate (DecodeRow, DecodeValue, decodeValue, interp, sql)
+import Hasql.Interpolate (DecodeRow, DecodeValue, Sql, decodeValue, interp, sql)
 import Hasql.Statement (Statement)
 
 data GeneratedAsIdentity
@@ -132,12 +133,13 @@ readColumns oids =
     |]
 
 data ForeignKeyConstraintRow = ForeignKeyConstraintRow
-  { constraintName :: !Text,
-    tableOid :: !Oid,
-    columnNames :: ![Text],
+  { sourceTableOid :: !Oid,
+    sourceTableName :: !Text,
+    sourceColumnNames :: ![Text],
     targetTableOid :: !Oid,
     targetTableName :: !Text,
     targetColumnNames :: ![Text],
+    constraintName :: !Text,
     onDelete :: !OnDelete,
     onUpdate :: !OnUpdate,
     fullText :: !Text
@@ -146,13 +148,21 @@ data ForeignKeyConstraintRow = ForeignKeyConstraintRow
   deriving anyclass (DecodeRow)
 
 readForeignKeyConstraints :: [Oid] -> Statement () [ForeignKeyConstraintRow]
-readForeignKeyConstraints oids =
+readForeignKeyConstraints =
+  readForeignKeyConstraints_ [sql|conrelid|]
+
+readIncomingForeignKeyConstraints :: [Oid] -> Statement () [ForeignKeyConstraintRow]
+readIncomingForeignKeyConstraints =
+  readForeignKeyConstraints_ [sql|confrelid|]
+
+readForeignKeyConstraints_ :: Sql -> [Oid] -> Statement () [ForeignKeyConstraintRow]
+readForeignKeyConstraints_ col oids =
   interp
     False
     [sql|
       SELECT
-        c.conname :: pg_catalog.text,
         c.conrelid :: pg_catalog.int8,
+        t.relname :: pg_catalog.text,
         (
           SELECT array_agg(a.attname ORDER BY a.attnum)
           FROM pg_catalog.pg_attribute a
@@ -167,11 +177,13 @@ readForeignKeyConstraints oids =
           WHERE a.attrelid = c.confrelid
             AND a.attnum = ANY(c.confkey)
         ),
+        c.conname :: pg_catalog.text,
         c.confdeltype,
         c.confupdtype,
-        pg_catalog.pg_get_constraintdef(oid, true)
+        pg_catalog.pg_get_constraintdef(c.oid, true)
       FROM pg_catalog.pg_constraint c
-      WHERE c.confrelid = ANY(#{oids})
+        JOIN pg_catalog.pg_class t ON c.conrelid = t.oid
+      WHERE c.^{col} = ANY(#{oids})
         AND c.contype = 'f'
       ORDER BY c.conname;
     |]
@@ -180,7 +192,7 @@ data IndexRow = IndexRow
   { tableOid :: !Oid,
     indexName :: !Text,
     isUnique :: !Bool,
-    columnIndexes :: ![Int16],
+    columnNames :: ![Maybe Text], -- Nothing means hole for expression
     numKeyColumns :: !Int16,
     expressions :: !(Maybe Text),
     predicate :: !(Maybe Text)
@@ -197,7 +209,17 @@ readIndexes oids =
         c1.oid :: pg_catalog.int8,
         c2.relname :: pg_catalog.text,
         i.indisunique,
-        i.indkey :: pg_catalog.int2[],
+        (
+          SELECT array_agg(a.attname :: pg_catalog.text ORDER BY zzz.r)
+          FROM (
+            SELECT row_number() OVER () r, n
+            FROM (SELECT unnest(i.indkey) n)
+          ) zzz
+          LEFT JOIN pg_catalog.pg_attribute a ON
+            a.attrelid = i.indrelid
+              AND a.attnum != 0
+              AND zzz.n = a.attnum
+        ),
         i.indnkeyatts,
         pg_catalog.pg_get_expr(i.indexprs, c1.oid, true) :: pg_catalog.text,
         pg_catalog.pg_get_expr(i.indpred, c1.oid, true) :: pg_catalog.text
