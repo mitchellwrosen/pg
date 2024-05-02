@@ -22,26 +22,28 @@ import Queue qualified
 import Witch (unsafeInto)
 
 prettyColumn :: ColumnRow -> [ForeignKeyConstraintRow] -> [Doc AnsiStyle]
-prettyColumn row {-(name, typ, generatedAsIdentity, nullable, maybeDefault)-} foreignKeyConstraints =
-  [ fold
-      [ annotate (color Green <> bold) (pretty row.name),
-        " : ",
-        annotate
-          (color Yellow <> italicized)
-          (pretty (aliasType row.type_) <> prettyIf row.nullable "?"),
-        case (row.default_, row.generatedAsIdentity) of
-          (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
-          (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
-          (_, GeneratedByDefaultAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
-          (_, NotGeneratedAsIdentity) -> mempty,
-        case foreignKeyConstraints of
-          [c] -> prettyForeignKeyConstraint False c
-          _ -> mempty
+prettyColumn row foreignKeyConstraints
+  | row.dropped = [annotate (color Black <> bold) "«dropped»"]
+  | otherwise =
+      [ fold
+          [ annotate (color Green <> bold) (pretty row.name),
+            " : ",
+            annotate
+              (color Yellow <> italicized)
+              (pretty (aliasType row.type_) <> prettyIf row.nullable "?"),
+            case (row.default_, row.generatedAsIdentity) of
+              (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
+              (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
+              (_, GeneratedByDefaultAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
+              (_, NotGeneratedAsIdentity) -> mempty,
+            case foreignKeyConstraints of
+              [c] -> prettyForeignKeyConstraint False c
+              _ -> mempty
+          ]
       ]
-  ]
-    ++ case foreignKeyConstraints of
-      [_] -> [] -- rendered it inline above
-      _ -> map (\c -> " " <> prettyForeignKeyConstraint False c) foreignKeyConstraints
+        ++ case foreignKeyConstraints of
+          [_] -> [] -- rendered it inline above
+          _ -> map (\c -> " " <> prettyForeignKeyConstraint False c) foreignKeyConstraints
   where
     -- prettify the types a bit
     aliasType :: Text -> Text
@@ -112,10 +114,9 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
       line,
       "│",
       columns & foldMap \column ->
-        prettyIf (not column.dropped) $
-          foldMap
-            (\doc -> line <> "│" <> doc)
-            (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
+        foldMap
+          (\doc -> line <> "│" <> doc)
+          (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
       foldMap
         (\c -> line <> "│" <> prettyForeignKeyConstraint True c)
         ( -- Filter out single-column foreign keys because we show them with the column, not at the bottom

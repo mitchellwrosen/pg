@@ -61,9 +61,6 @@ data ColumnRow = ColumnRow
     generatedAsIdentity :: !GeneratedAsIdentity,
     nullable :: !Bool,
     default_ :: !(Maybe Text),
-    -- we read this column out too rather than filter them out with a WHERE clause because the pg_index table refers to
-    -- columns by their index offset (never pointing directly to a dropped column, of course, but we need the accurate
-    -- offset nonetheless)
     dropped :: !Bool
   }
   deriving stock (Generic)
