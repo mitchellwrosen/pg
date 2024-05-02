@@ -47,3 +47,4 @@ executable pg
     PgPrettyUtils
     PgQueries
     PgTablePretty
+    PgUtils

@@ -5,7 +5,7 @@ where
 
 import Data.Foldable (fold)
 import Data.Function ((&))
-import Data.Int (Int16, Int64)
+import Data.Int (Int16)
 import Data.List qualified as List
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -14,15 +14,25 @@ import Data.Text qualified as Text
 import Data.Vector (Vector)
 import Data.Vector qualified as Vector
 import PgPrettyUtils (prettyBytes, prettyInt)
-import PgQueries (ColumnRow (..), ForeignKeyConstraintRow (..), GeneratedAsIdentity (..), IndexRow (..), OnDelete (..))
+import PgQueries
+  ( CheckConstraintRow (..),
+    ColumnRow (..),
+    ForeignKeyConstraintRow (..),
+    GeneratedAsIdentity (..),
+    IndexRow (..),
+    OnDelete (..),
+    OnUpdate (..),
+    TableRow (..),
+  )
+import PgUtils (rowsByKey)
 import Prettyprinter hiding (column)
 import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized)
 import Queue (Queue)
 import Queue qualified
 import Witch (unsafeInto)
 
-prettyColumn :: ColumnRow -> [ForeignKeyConstraintRow] -> [Doc AnsiStyle]
-prettyColumn row foreignKeyConstraints
+prettyColumn :: ColumnRow -> [CheckConstraintRow] -> [ForeignKeyConstraintRow] -> [Doc AnsiStyle]
+prettyColumn row checkConstraints foreignKeyConstraints
   | row.dropped = [annotate (color Black <> bold) "«dropped»"]
   | otherwise =
       [ fold
@@ -31,6 +41,14 @@ prettyColumn row foreignKeyConstraints
             annotate
               (color Yellow <> italicized)
               (pretty (aliasType row.type_) <> prettyIf row.nullable "?"),
+            prettyIf (not (null checkConstraints)) $
+              fold
+                [ " ∣ ",
+                  checkConstraints
+                    & map (prettyCheckConstraintDefinition . (.definition))
+                    & punctuate ", "
+                    & fold
+                ],
             case (row.default_, row.generatedAsIdentity) of
               (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
               (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
@@ -65,6 +83,10 @@ prettyColumn row foreignKeyConstraints
       "timestamp without time zone" -> "timestamp"
       t -> t
 
+prettyCheckConstraintDefinition :: Text -> Doc AnsiStyle
+prettyCheckConstraintDefinition =
+  annotate (color Magenta) . pretty . Text.dropEnd 1 . Text.drop 7
+
 prettyForeignKeyConstraint :: Bool -> ForeignKeyConstraintRow -> Doc AnsiStyle
 prettyForeignKeyConstraint showSource row =
   fold
@@ -77,7 +99,13 @@ prettyForeignKeyConstraint showSource row =
         OnDeleteNoAction -> mempty
         OnDeleteRestrict -> mempty
         OnDeleteSetDefault -> annotate italicized " on delete set default"
-        OnDeleteSetNull -> annotate italicized " on delete set null"
+        OnDeleteSetNull -> annotate italicized " on delete set null",
+      case row.onUpdate of
+        OnUpdateCascade -> annotate italicized " on update cascade"
+        OnUpdateNoAction -> mempty
+        OnUpdateRestrict -> mempty
+        OnUpdateSetDefault -> annotate italicized " on update set default"
+        OnUpdateSetNull -> annotate italicized " on update set null"
     ]
   where
     prettyConstraintSource :: [Text] -> Doc AnsiStyle
@@ -85,38 +113,37 @@ prettyForeignKeyConstraint showSource row =
       annotate (colorDull Green) . pretty . Text.intercalate ","
 
 prettyTable ::
-  Text ->
-  Text ->
-  Maybe Text ->
+  TableRow ->
   Vector ColumnRow ->
   [ForeignKeyConstraintRow] ->
-  Float ->
-  Int64 ->
+  [CheckConstraintRow] ->
   [IndexRow] ->
   Doc AnsiStyle
-prettyTable schema tableName maybeType columns foreignKeyConstraints tuples bytes indexes =
+prettyTable table columns foreignKeyConstraints checkConstraints indexes =
   fold
     [ "╭─",
       line,
-      "│" <> annotate bold (prettyIf (schema /= "public") (pretty schema <> ".") <> pretty tableName),
-      case maybeType of
+      "│",
+      if table.visible then annotate italicized ("(" <> pretty table.schema <> "." <> ")") else annotate bold (pretty table.schema) <> ".",
+      annotate bold (pretty table.name),
+      case table.type_ of
         Nothing -> mempty
-        Just typ -> " :: " <> annotate (color Yellow <> italicized) (pretty typ),
-      prettyIf (tuples /= -1) $
+        Just type_ -> " :: " <> annotate (color Yellow <> italicized) (pretty type_),
+      prettyIf table.unlogged (" " <> annotate italicized "unlogged"),
+      prettyIf (table.tuples /= -1) $
         fold
           [ " | ",
-            annotate (colorDull Cyan) case round tuples of
+            annotate (colorDull Cyan) case round table.tuples of
               1 -> "1 row"
               tuples1 -> prettyInt tuples1 <> " rows",
             " | ",
-            annotate (color Green) (prettyBytes (unsafeInto @Int bytes))
+            annotate (color Green) (prettyBytes (unsafeInto @Int table.bytes))
           ],
       line,
       "│",
       columns & foldMap \column ->
-        foldMap
-          (\doc -> line <> "│" <> doc)
-          (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
+        prettyColumn column (getOneColumnCheckConstraints column.num) (getForeignKeyConstraints column.name) & foldMap \doc ->
+          line <> "│" <> doc,
       foldMap
         (\c -> line <> "│" <> prettyForeignKeyConstraint True c)
         ( -- Filter out single-column foreign keys because we show them with the column, not at the bottom
@@ -126,6 +153,8 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
               _ -> True
         ),
       line,
+      twoColumnCheckConstraints & foldMap \constraint ->
+        "│" <> prettyCheckConstraintDefinition constraint.definition <> line,
       prettyIf (not (null indexes)) ("│" <> line),
       indexes & foldMap \index ->
         let columnIndexToPrettyColumn i =
@@ -166,16 +195,26 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
       "╰─"
     ]
   where
-    foreignKeyConstraints1 :: Map Text (Queue ForeignKeyConstraintRow)
-    foreignKeyConstraints1 =
-      List.foldl'
-        ( \acc row ->
-            case row.columnNames of
-              [name] -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) name acc
-              _ -> acc
-        )
-        Map.empty
-        foreignKeyConstraints
+    getForeignKeyConstraints :: Text -> [ForeignKeyConstraintRow]
+    getForeignKeyConstraints =
+      rowsByKey (getOne . (.columnNames)) (filter (one . (.columnNames)) foreignKeyConstraints)
+
+    getOneColumnCheckConstraints :: Int16 -> [CheckConstraintRow]
+    getOneColumnCheckConstraints =
+      rowsByKey (getOne . (.columns)) (filter (one . (.columns)) checkConstraints)
+
+    twoColumnCheckConstraints :: [CheckConstraintRow]
+    twoColumnCheckConstraints =
+      filter (two . (.columns)) checkConstraints
+      where
+        two (_ : _ : _) = True
+        two _ = False
+
+    one [_] = True
+    one _ = False
+
+    getOne [x] = x
+    getOne _ = undefined
 
 prettyIf :: Bool -> Doc a -> Doc a
 prettyIf True x = x

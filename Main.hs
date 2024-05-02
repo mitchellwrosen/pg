@@ -11,6 +11,7 @@ import Data.Function ((&))
 import Data.Functor (void)
 import Data.List qualified as List
 import Data.Map.Strict (Map)
+import PgUtils (rowsByKey)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
@@ -30,7 +31,7 @@ import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
 import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
 import PgPrettyUtils (putPretty)
-import PgQueries (ColumnRow, ForeignKeyConstraintRow, IndexRow, Oid)
+import PgQueries (CheckConstraintRow, ColumnRow, ForeignKeyConstraintRow, IndexRow, Oid)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
 import Prettyprinter qualified
@@ -472,46 +473,30 @@ pgTables = do
                 let tableOids = map (.oid) tables
                 columns <- Hasql.statement () (PgQueries.readColumns tableOids)
                 foreignKeyConstraints <- Hasql.statement () (PgQueries.readForeignKeyConstraints tableOids)
+                checkConstraints <- Hasql.statement () (PgQueries.readCheckConstraints tableOids)
                 indexes <- Hasql.statement () (PgQueries.readIndexes tableOids)
-                pure (tables, columns, foreignKeyConstraints, indexes)
+                pure (tables, columns, foreignKeyConstraints, checkConstraints, indexes)
            in Right <$> Hasql.run session connection
   result1 <-
     result & onLeft \connErr -> do
       Text.putStrLn (maybe "" Text.decodeUtf8 connErr)
       exitFailure
-  (tables, columns, foreignKeyConstraints, indexes) <-
+  (tables, columns, foreignKeyConstraints, checkConstraints, indexes) <-
     result1 & onLeft \queryErr -> do
       Text.putStrLn (Text.pack (show queryErr))
       exitFailure
-  let columns1 :: Map Oid (Queue ColumnRow)
-      columns1 =
-        List.foldl'
-          (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
-          Map.empty
-          columns
-  let foreignKeyConstraints1 :: Map Oid (Queue ForeignKeyConstraintRow)
-      foreignKeyConstraints1 =
-        List.foldl'
-          (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
-          Map.empty
-          foreignKeyConstraints
-  let indexes1 :: Map Oid (Queue IndexRow)
-      indexes1 =
-        List.foldl'
-          (\acc row -> Map.alter (Just . maybe (Queue.singleton row) (Queue.enqueue row)) row.tableOid acc)
-          Map.empty
-          indexes
+  let getColumns = rowsByKey (.tableOid) columns
+  let getForeignKeyConstraints = rowsByKey (.tableOid) foreignKeyConstraints
+  let getCheckConstraints = rowsByKey (.tableOid) checkConstraints
+  let getIndexes = rowsByKey (.tableOid) indexes
   for_ tables \table ->
     putPretty $
       prettyTable
-        table.schema
-        table.name
-        table.type_
-        (maybe Vector.empty (Vector.fromList . Queue.toList) (Map.lookup table.oid columns1))
-        (maybe [] Queue.toList (Map.lookup table.oid foreignKeyConstraints1))
-        table.tuples
-        table.bytes
-        (maybe [] Queue.toList (Map.lookup table.oid indexes1))
+        table
+        (Vector.fromList (getColumns table.oid))
+        (getForeignKeyConstraints table.oid)
+        (getCheckConstraints table.oid)
+        (getIndexes table.oid)
 
 pgUp :: IO ()
 pgUp = do

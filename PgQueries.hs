@@ -2,6 +2,9 @@ module PgQueries
   ( GeneratedAsIdentity (..),
     Oid,
     OnDelete (..),
+    OnUpdate (..),
+    CheckConstraintRow (..),
+    readCheckConstraints,
     ColumnRow (..),
     readColumns,
     ForeignKeyConstraintRow (..),
@@ -54,8 +57,49 @@ instance DecodeValue OnDelete where
       "r" -> OnDeleteRestrict
       _ -> OnDeleteNoAction
 
+data OnUpdate
+  = OnUpdateCascade
+  | OnUpdateNoAction
+  | OnUpdateRestrict
+  | OnUpdateSetDefault
+  | OnUpdateSetNull
+
+instance DecodeValue OnUpdate where
+  decodeValue :: Decoder.Value OnUpdate
+  decodeValue =
+    Decoder.text <&> \case
+      "c" -> OnUpdateCascade
+      "d" -> OnUpdateSetDefault
+      "n" -> OnUpdateSetNull
+      "r" -> OnUpdateRestrict
+      _ -> OnUpdateNoAction
+
+data CheckConstraintRow = CheckConstraintRow
+  { tableOid :: !Oid,
+    columns :: ![Int16],
+    definition :: !Text
+  }
+  deriving stock (Generic)
+  deriving anyclass (DecodeRow)
+
+readCheckConstraints :: [Oid] -> Statement () [CheckConstraintRow]
+readCheckConstraints oids =
+  interp
+    False
+    [sql|
+      SELECT
+        conrelid :: pg_catalog.int8,
+        conkey,
+        pg_catalog.pg_get_constraintdef(oid, true)
+      FROM pg_catalog.pg_constraint
+      WHERE conrelid = ANY(#{oids})
+        AND contype = 'c'
+      ORDER BY conrelid, conkey
+    |]
+
 data ColumnRow = ColumnRow
   { tableOid :: !Oid,
+    num :: !Int16, -- 1-based column number
     name :: !Text,
     type_ :: !Text,
     generatedAsIdentity :: !GeneratedAsIdentity,
@@ -73,6 +117,7 @@ readColumns oids =
     [sql|
       SELECT
         a.attrelid :: pg_catalog.int8,
+        a.attnum,
         a.attname :: pg_catalog.text,
         pg_catalog.format_type(a.atttypid, a.atttypmod),
         a.attidentity,
@@ -94,6 +139,7 @@ data ForeignKeyConstraintRow = ForeignKeyConstraintRow
     targetTableName :: !Text,
     targetColumnNames :: ![Text],
     onDelete :: !OnDelete,
+    onUpdate :: !OnUpdate,
     fullText :: !Text
   }
   deriving stock (Generic)
@@ -122,6 +168,7 @@ readForeignKeyConstraints oids =
             AND a.attnum = ANY(c.confkey)
         ),
         c.confdeltype,
+        c.confupdtype,
         pg_catalog.pg_get_constraintdef(oid, true)
       FROM pg_catalog.pg_constraint c
       WHERE c.confrelid = ANY(#{oids})
@@ -165,13 +212,14 @@ data TableRow = TableRow
     schema :: !Text,
     name :: !Text,
     type_ :: !(Maybe Text),
+    unlogged :: !Bool,
+    visible :: !Bool,
     tuples :: !Float,
     bytes :: !Int64
   }
   deriving stock (Generic)
   deriving anyclass (DecodeRow)
 
--- oid, schema, name, type, tuples, bytes
 readTables :: Statement () [TableRow]
 readTables =
   interp
@@ -186,6 +234,8 @@ readTables =
             THEN null
             ELSE c.reloftype :: pg_catalog.regtype :: pg_catalog.text
         END,
+        c.relpersistence = 'u',
+        pg_catalog.pg_table_is_visible(c.oid),
         c.reltuples,
         (c.relpages :: pg_catalog.int8) * (current_setting('block_size') :: pg_catalog.int8)
       FROM pg_catalog.pg_class AS c

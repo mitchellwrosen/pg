@@ -25,24 +25,20 @@ putPretty =
 
 prettyBytes :: Int -> Doc a
 prettyBytes b
-  | b < 995 = pretty b <> plur b " byte" " bytes"
-  | b < 9950 = prettyDouble 2 kb <> plur kb " kilobyte" " kilobytes"
-  | b < 99500 = prettyDouble 1 kb <> plur kb " kilobyte" " kilobytes"
-  | b < 995000 = prettyDouble 0 kb <> plur kb " kilobyte" " kilobytes"
-  | b < 9950000 = prettyDouble 2 mb <> plur mb " megabyte" " megabytes"
-  | b < 99500000 = prettyDouble 1 mb <> plur mb " megabyte" " megabytes"
-  | b < 995000000 = prettyDouble 0 mb <> plur mb " megabyte" " megabytes"
-  | b < 9950000000 = prettyDouble 2 gb <> plur gb " gigabyte" " gigabytes"
-  | b < 99500000000 = prettyDouble 1 gb <> plur gb " gigabyte" " gigabytes"
-  | otherwise = prettyDouble 0 gb <> plur gb " gigabyte" " gigabytes"
+  | b < 995 = pretty b <> " b"
+  | b < 9950 = prettyDouble 2 kb <> " kb"
+  | b < 99500 = prettyDouble 1 kb <> " kb"
+  | b < 995000 = prettyDouble 0 kb <> " kb"
+  | b < 9950000 = prettyDouble 2 mb <> " mb"
+  | b < 99500000 = prettyDouble 1 mb <> " mb"
+  | b < 995000000 = prettyDouble 0 mb <> " mb"
+  | b < 9950000000 = prettyDouble 2 gb <> " gb"
+  | b < 99500000000 = prettyDouble 1 gb <> " gb"
+  | otherwise = prettyDouble 0 gb <> " gb"
   where
     kb = realToFrac @Int @Double b / 1_000
     mb = realToFrac @Int @Double b / 1_000_000
     gb = realToFrac @Int @Double b / 1_000_000_000
-
-    plur :: (Eq a, Num a) => a -> b -> b -> b
-    plur 1 x _ = x
-    plur _ _ y = y
 
 prettyDouble :: Int -> Double -> Doc a
 prettyDouble i =
