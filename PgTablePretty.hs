@@ -9,7 +9,6 @@ import Data.Int (Int16)
 import Data.Maybe (fromJust)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Vector (Vector)
 import PgPrettyUtils (prettyBytes, prettyInt)
 import PgQueries
   ( CheckConstraintRow (..),
@@ -138,7 +137,7 @@ prettyOnUpdate = \case
 
 prettyTable ::
   TableRow ->
-  Vector ColumnRow ->
+  [ColumnRow] ->
   [ForeignKeyConstraintRow] ->
   [ForeignKeyConstraintRow] ->
   [CheckConstraintRow] ->
@@ -174,8 +173,7 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
           (getOneColumnCheckConstraints column.num)
           (getForeignKeyConstraints column.name)
           (getIncomingForeignKeyConstraints column.name)
-          & foldMap \doc ->
-            line <> "│" <> doc,
+          & foldMap \doc -> line <> "│" <> doc,
       foreignKeyConstraints
         -- Filter out single-column foreign keys because we show them with the column, not at the bottom
         & filter (not . one . (.sourceColumnNames))

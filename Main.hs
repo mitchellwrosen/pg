@@ -17,7 +17,6 @@ import Data.Text.Builder.Linear qualified as Text.Builder
 import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
 import Data.Text.Read qualified as Text
-import Data.Vector qualified as Vector
 import Hasql.Connection qualified as Hasql
 import Hasql.Session qualified as Hasql
 import Network.Socket qualified as Network
@@ -490,7 +489,7 @@ pgTables = do
     putPretty $
       prettyTable
         table
-        (Vector.fromList (getColumns table.oid))
+        (getColumns table.oid)
         (getForeignKeyConstraints table.oid)
         (getIncomingForeignKeyConstraints table.oid)
         (getCheckConstraints table.oid)
