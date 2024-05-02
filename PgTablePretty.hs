@@ -28,7 +28,7 @@ prettyColumn row {-(name, typ, generatedAsIdentity, nullable, maybeDefault)-} fo
         " : ",
         annotate
           (color Yellow <> italicized)
-          (pretty (aliasType row.type_) <> (if row.nullable then "?" else mempty)),
+          (pretty (aliasType row.type_) <> prettyIf row.nullable "?"),
         case (row.default_, row.generatedAsIdentity) of
           (Just default_, _) -> " = " <> annotate (color Magenta) (pretty default_)
           (_, GeneratedAlwaysAsIdentity) -> " = " <> annotate (color Magenta) "«autoincrement»"
@@ -66,7 +66,7 @@ prettyColumn row {-(name, typ, generatedAsIdentity, nullable, maybeDefault)-} fo
 prettyForeignKeyConstraint :: Bool -> ForeignKeyConstraintRow -> Doc AnsiStyle
 prettyForeignKeyConstraint showSource row =
   fold
-    [ if showSource then prettyConstraintSource row.columnNames else mempty,
+    [ prettyIf showSource (prettyConstraintSource row.columnNames),
       " → ",
       annotate (colorDull Green) (pretty row.targetTableName <> "."),
       prettyConstraintSource row.targetColumnNames,
@@ -96,39 +96,36 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
   fold
     [ "╭─",
       line,
-      "│" <> annotate bold ((if schema /= "public" then (pretty schema <> ".") else mempty) <> pretty tableName),
+      "│" <> annotate bold (prettyIf (schema /= "public") (pretty schema <> ".") <> pretty tableName),
       case maybeType of
         Nothing -> mempty
         Just typ -> " :: " <> annotate (color Yellow <> italicized) (pretty typ),
+      prettyIf (tuples /= -1) $
+        fold
+          [ " | ",
+            annotate (colorDull Cyan) case round tuples of
+              1 -> "1 row"
+              tuples1 -> prettyInt tuples1 <> " rows",
+            " | ",
+            annotate (color Green) (prettyBytes (unsafeInto @Int bytes))
+          ],
+      line,
+      "│",
       columns & foldMap \column ->
-        if column.dropped
-          then mempty
-          else
-            foldMap
-              (\doc -> line <> "│  " <> doc)
-              (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
+        prettyIf (not column.dropped) $
+          foldMap
+            (\doc -> line <> "│" <> doc)
+            (prettyColumn column (maybe [] Queue.toList (Map.lookup column.name foreignKeyConstraints1))),
       foldMap
-        (\c -> line <> "│  " <> prettyForeignKeyConstraint True c)
+        (\c -> line <> "│" <> prettyForeignKeyConstraint True c)
         ( -- Filter out single-column foreign keys because we show them with the column, not at the bottom
           foreignKeyConstraints & filter \constraint ->
             case constraint.columnNames of
               [_] -> False
               _ -> True
         ),
-      if tuples /= -1
-        then
-          fold
-            [ line,
-              "│",
-              annotate (colorDull Cyan) case round tuples of
-                1 -> "1 row"
-                tuples1 -> prettyInt tuples1 <> " rows",
-              " ",
-              annotate (color Green) ("(" <> prettyBytes (unsafeInto @Int bytes) <> ")")
-            ]
-        else mempty,
       line,
-      if null indexes then mempty else "│" <> line,
+      prettyIf (not (null indexes)) ("│" <> line),
       indexes & foldMap \index ->
         let columnIndexToPrettyColumn i =
               let column = columns Vector.! fromIntegral @Int16 @Int (i - 1)
@@ -155,8 +152,8 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
                               (map (annotate (color Magenta) . pretty) . Text.splitOn ", ")
                               index.expressions
                           )
-                 in "  ∙ " <> fold (punctuate ", " things),
-                if index.isUnique then " unique" else mempty,
+                 in fold (punctuate ", " things),
+                prettyIf index.isUnique " unique",
                 case index.predicate of
                   Nothing -> mempty
                   Just predicate -> " where " <> annotate (color Magenta) (pretty predicate),
@@ -178,6 +175,10 @@ prettyTable schema tableName maybeType columns foreignKeyConstraints tuples byte
         )
         Map.empty
         foreignKeyConstraints
+
+prettyIf :: Bool -> Doc a -> Doc a
+prettyIf True x = x
+prettyIf False _ = mempty
 
 -- `fillHoles def dirt xs` plugs each `Nothing` in `xs` with a value from `dirt`, and if/when `dirt` runs out, starts
 -- plugging with `def` instead.
