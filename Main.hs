@@ -12,6 +12,7 @@ import Data.Functor (void)
 import Data.List qualified as List
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Builder.Linear qualified as Text.Builder
@@ -223,20 +224,20 @@ pgExec queryOrFilename = do
             pure stateDir
         )
   port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
-  query <-
-    Directory.doesFileExist (Text.unpack queryOrFilename) >>= \case
-      False -> pure queryOrFilename
-      True -> Text.readFile (Text.unpack queryOrFilename)
+  isFilename <- Directory.doesFileExist (Text.unpack queryOrFilename)
   username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
   (out, err, code) <-
     process
       "psql"
-      [ "--command=" <> query,
-        "--dbname=" <> dbname,
-        "--host=" <> host,
-        "--port=" <> port,
-        "--username=" <> username
-      ]
+      ( catMaybes
+          [ if isFilename then Nothing else Just ("--command=" <> queryOrFilename),
+            Just ("--dbname=" <> dbname),
+            if isFilename then Just ("--file=" <> queryOrFilename) else Nothing,
+            Just ("--host=" <> host),
+            Just ("--port=" <> port),
+            Just ("--username=" <> username)
+          ]
+      )
   Text.putStr out
   Text.putStr err
   exitWith code
