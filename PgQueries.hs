@@ -219,7 +219,7 @@ readIndexes oids =
             a.attrelid = i.indrelid
               AND a.attnum != 0
               AND n.n = a.attnum
-        ),
+        ) colnames,
         i.indnkeyatts,
         pg_catalog.pg_get_expr(i.indexprs, c1.oid, true) :: pg_catalog.text,
         pg_catalog.pg_get_expr(i.indpred, c1.oid, true) :: pg_catalog.text
@@ -227,6 +227,7 @@ readIndexes oids =
         JOIN pg_catalog.pg_index AS i ON c1.oid = i.indrelid
         JOIN pg_catalog.pg_class AS c2 ON i.indexrelid = c2.oid
       WHERE c1.oid = ANY(#{oids})
+      ORDER BY colnames
     |]
 
 data TableRow = TableRow
