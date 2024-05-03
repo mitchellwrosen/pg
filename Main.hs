@@ -180,12 +180,13 @@ pgCreate = do
   (out, err, code) <-
     process
       "initdb"
-      [ "--encoding=UTF8",
-        "--locale=en_US.UTF-8",
-        "--no-sync",
-        "--pgdata=" <> clusterDir,
-        "--username=postgres"
-      ]
+      ( fold
+          [ ["-D", clusterDir],
+            ["-E", "UTF8"],
+            ["--locale=en_US.UTF-8"],
+            ["-U", "postgres"]
+          ]
+      )
   when (code /= ExitSuccess) do
     Text.putStr out
     Text.putStr err
@@ -224,13 +225,13 @@ pgExec queryOrFilename = do
   (out, err, code) <-
     process
       "psql"
-      ( catMaybes
-          [ if isFilename then Nothing else Just ("--command=" <> queryOrFilename),
-            Just ("--dbname=" <> dbname),
-            if isFilename then Just ("--file=" <> queryOrFilename) else Nothing,
-            Just ("--host=" <> host),
-            Just ("--port=" <> port),
-            Just ("--username=" <> username)
+      ( fold
+          [ if isFilename then [] else ["-c", queryOrFilename],
+            ["-d", dbname],
+            if isFilename then ["-f", queryOrFilename] else [],
+            ["-h", host],
+            ["-p", port],
+            ["-U", username]
           ]
       )
   Text.putStr out
@@ -276,16 +277,14 @@ pgExplain maybeDatabase queryOrFilename parameters = do
     process
       "psql"
       ( fold
-          [ map ("--command=" <>) commands,
-            [ "--dbname=" <> dbname,
-              "--host=" <> host,
-              "--no-align",
-              "--port=" <> port,
-              -- This silences the "PREPARE" output, if we prepare
-              "--quiet",
-              "--tuples-only",
-              "--username=" <> username
-            ]
+          [ ["-A"],
+            foldMap (\command -> ["-c", command]) commands,
+            ["-d", dbname],
+            ["-h", host],
+            ["-p", host],
+            ["-q"], -- This silences the "PREPARE" output, if we prepare
+            ["-t"],
+            ["-U", username]
           ]
       )
   if code == ExitSuccess
@@ -309,12 +308,14 @@ pgLoad maybeDatabase file = do
   (out, err, code) <-
     process
       "pg_restore"
-      [ "--dbname=" <> dbname,
-        "--host=" <> host,
-        "--port=" <> port,
-        "--username=" <> username,
-        file
-      ]
+      ( fold
+          [ ["-d", dbname],
+            ["-h", host],
+            ["-p", port],
+            ["-U", username],
+            [file]
+          ]
+      )
   when (code /= ExitSuccess) do
     Text.putStr out
     Text.putStr err
@@ -352,46 +353,50 @@ pgRepl = do
   code <-
     foreground
       "psql"
-      [ "--dbname=" <> dbname,
-        "--host=" <> host,
-        "--port=" <> port,
-        "--pset=null=∅",
-        let style x y = "%[%033[" <> Text.intercalate ";" x <> "m%]" <> y <> "%[%033[0m%]"
-            blue = "34"
-            bold = "1"
-            green = "32"
-            italic = "3"
-            magenta = "35"
-            yellow = "33"
-         in fold
-              [ "--set=PROMPT1=",
-                "╭ ",
-                if host == stateDir
-                  then mempty
-                  else
-                    fold
-                      [ style [italic, yellow] "host",
-                        " ",
-                        style [bold, yellow] "%M",
-                        "\n│ "
-                      ],
-                style [italic, green] "port",
-                " ",
-                style [bold, green] "%>",
-                "\n│ ",
-                style [italic, magenta] "user",
-                " ",
-                style [bold, magenta] "%n",
-                "\n│ ",
-                style [italic, blue] "database",
-                " ",
-                style [bold, blue] "%/",
-                "\n╰ ",
-                "%# " -- # (superuser) or > (user)
-              ],
-        "--set=PROMPT2=%w ",
-        "--username=" <> username
-      ]
+      ( fold
+          [ ["-d", dbname],
+            ["-h", host],
+            ["-p", port],
+            ["-P", "null=∅"],
+            ["-U", username],
+            [ "-v",
+              let style x y = "%[%033[" <> Text.intercalate ";" x <> "m%]" <> y <> "%[%033[0m%]"
+                  blue = "34"
+                  bold = "1"
+                  green = "32"
+                  italic = "3"
+                  magenta = "35"
+                  yellow = "33"
+               in fold
+                    [ "PROMPT1=",
+                      "╭ ",
+                      if host == stateDir
+                        then mempty
+                        else
+                          fold
+                            [ style [italic, yellow] "host",
+                              " ",
+                              style [bold, yellow] "%M",
+                              "\n│ "
+                            ],
+                      style [italic, green] "port",
+                      " ",
+                      style [bold, green] "%>",
+                      "\n│ ",
+                      style [italic, magenta] "user",
+                      " ",
+                      style [bold, magenta] "%n",
+                      "\n│ ",
+                      style [italic, blue] "database",
+                      " ",
+                      style [bold, blue] "%/",
+                      "\n╰ ",
+                      "%# " -- # (superuser) or > (user)
+                    ]
+            ],
+            ["-v", "PROMPT2=%w "]
+          ]
+      )
   exitWith code
 
 pgSyntaxCreateIndex :: Bool -> Maybe Text -> [Text] -> Maybe Text -> Bool -> Maybe Text -> Bool -> Bool -> Maybe Text -> IO ()
