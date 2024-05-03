@@ -210,15 +210,15 @@ readIndexes oids =
         c2.relname :: pg_catalog.text,
         i.indisunique,
         (
-          SELECT array_agg(a.attname :: pg_catalog.text ORDER BY zzz.r)
+          SELECT array_agg(a.attname :: pg_catalog.text ORDER BY n.r)
           FROM (
             SELECT row_number() OVER () r, n
-            FROM (SELECT unnest(i.indkey) n)
-          ) zzz
+            FROM (SELECT unnest(i.indkey) n) n
+          ) n
           LEFT JOIN pg_catalog.pg_attribute a ON
             a.attrelid = i.indrelid
               AND a.attnum != 0
-              AND zzz.n = a.attnum
+              AND n.n = a.attnum
         ),
         i.indnkeyatts,
         pg_catalog.pg_get_expr(i.indexprs, c1.oid, true) :: pg_catalog.text,
