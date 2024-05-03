@@ -193,8 +193,8 @@ data IndexRow = IndexRow
     indexName :: !Text,
     isUnique :: !Bool,
     columnNames :: ![Maybe Text], -- Nothing means hole for expression
-    numKeyColumns :: !Int16,
     expressions :: !(Maybe Text),
+    numKeyColumns :: !Int16,
     predicate :: !(Maybe Text)
   }
   deriving stock (Generic)
@@ -220,8 +220,8 @@ readIndexes oids =
               AND a.attnum != 0
               AND n.n = a.attnum
         ) colnames,
-        i.indnkeyatts,
         pg_catalog.pg_get_expr(i.indexprs, c1.oid, true) :: pg_catalog.text,
+        i.indnkeyatts,
         pg_catalog.pg_get_expr(i.indpred, c1.oid, true) :: pg_catalog.text
       FROM pg_catalog.pg_class AS c1
         JOIN pg_catalog.pg_index AS i ON c1.oid = i.indrelid

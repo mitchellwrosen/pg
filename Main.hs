@@ -10,7 +10,6 @@ import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
 import Data.List qualified as List
-import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Builder.Linear qualified as Text.Builder
@@ -281,7 +280,7 @@ pgExplain maybeDatabase queryOrFilename parameters = do
             foldMap (\command -> ["-c", command]) commands,
             ["-d", dbname],
             ["-h", host],
-            ["-p", host],
+            ["-p", port],
             ["-q"], -- This silences the "PREPARE" output, if we prepare
             ["-t"],
             ["-U", username]

@@ -7,6 +7,8 @@ import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Int (Int16)
 import Data.Maybe (fromJust)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import PgPrettyUtils (prettyBytes, prettyInt)
@@ -20,24 +22,26 @@ import PgQueries
     OnUpdate (..),
     TableRow (..),
   )
-import PgUtils (rowsByKey)
+import PgUtils (rowsByMaybeKey)
 import Prettyprinter hiding (column)
-import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized)
+import Prettyprinter.Render.Terminal (AnsiStyle, Color (..), bold, color, colorDull, italicized, underlined)
 import Queue (Queue)
 import Queue qualified
 import Witch (unsafeInto)
 
 prettyColumn ::
   ColumnRow ->
+  Bool ->
   [CheckConstraintRow] ->
   [ForeignKeyConstraintRow] ->
   [ForeignKeyConstraintRow] ->
   [Doc AnsiStyle]
-prettyColumn row checkConstraints foreignKeyConstraints incomingForeignKeyConststraints
+prettyColumn row unique checkConstraints foreignKeyConstraints incomingForeignKeyConststraints
   | row.dropped = [annotate (color Black <> bold) "«dropped»"]
   | otherwise =
       [ fold
           [ annotate (color Green <> bold) (pretty row.name),
+            prettyIf unique prettyUniqueMarker,
             " : ",
             annotate
               (color Yellow <> italicized)
@@ -107,8 +111,7 @@ prettyForeignKeyConstraint showSource row =
 prettyIncomingForeignKeyConstraint :: Bool -> ForeignKeyConstraintRow -> Doc AnsiStyle
 prettyIncomingForeignKeyConstraint showTarget row =
   fold
-    [ prettyIf showTarget (prettyCols row.targetColumnNames),
-      " ↑ ",
+    [ if showTarget then prettyCols row.targetColumnNames <> " ← " else " ↑ ",
       annotate (colorDull Green) (pretty row.sourceTableName <> "."),
       prettyCols row.sourceColumnNames,
       prettyOnDelete row.onDelete,
@@ -118,6 +121,19 @@ prettyIncomingForeignKeyConstraint showTarget row =
     prettyCols :: [Text] -> Doc AnsiStyle
     prettyCols =
       annotate (colorDull Green) . pretty . Text.intercalate ","
+
+prettyIndexKeyColumnsWith :: (Text -> Doc a) -> (Text -> Doc a) -> [Maybe Text] -> Maybe Text -> Int16 -> Doc a
+prettyIndexKeyColumnsWith prettyColName prettyExpr columnNames expressions numKeyColumns =
+  columnNames
+    & take (fromIntegral @Int16 @Int numKeyColumns)
+    & map (fmap prettyColName)
+    -- Splitting expressions on ", " isn't perfect, because an expression can of course have a comma+space
+    -- in it (e.g. a string literal), but that seems unlikely, so I don't want to invest more effort in
+    -- this at the moment. I could not find a way to return the expressions in an array rather than a text
+    -- - it seems our two options are do-or-do-not pass the column to pg_get_expr.
+    & fillHoles "«bug»" (maybe [] (map prettyExpr . Text.splitOn ", ") expressions)
+    & punctuate ","
+    & fold
 
 prettyOnDelete :: OnDelete -> Doc AnsiStyle
 prettyOnDelete = \case
@@ -170,66 +186,108 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
       columns & foldMap \column ->
         prettyColumn
           column
+          (Set.member column.name oneColumnUniqueConstraints)
           (getOneColumnCheckConstraints column.num)
           (getForeignKeyConstraints column.name)
           (getIncomingForeignKeyConstraints column.name)
           & foldMap \doc -> line <> "│" <> doc,
-      foreignKeyConstraints
-        -- Filter out single-column foreign keys because we show them with the column, not at the bottom
-        & filter (not . one . (.sourceColumnNames))
-        & foldMap \c -> line <> "│" <> prettyForeignKeyConstraint True c,
-      incomingForeignKeyConstraints
-        -- Filter out single-column foreign keys because we show them with the column, not at the bottom
-        & filter (not . one . (.sourceColumnNames))
-        & foldMap \c -> line <> "│" <> prettyIncomingForeignKeyConstraint True c,
       line,
-      twoColumnCheckConstraints & foldMap \constraint ->
-        "│" <> prettyCheckConstraintDefinition constraint.definition <> line,
-      prettyIf (not (null indexes)) ("│" <> line),
-      indexes & foldMap \index ->
-        let prettyColumnName = annotate (color Green) . pretty
-         in fold
+      let twoColumnForeignKeyConstraints =
+            foreignKeyConstraints
+              -- Filter out single-column foreign keys because we show them with the column, not at the bottom
+              & filter (not . one . (.sourceColumnNames))
+       in prettyIf (not (null twoColumnForeignKeyConstraints)) $
+            fold
               [ "│",
-                index.columnNames
-                  & take (fromIntegral @Int16 @Int index.numKeyColumns)
-                  & map (fmap prettyColumnName)
-                  -- Splitting expressions on ", " isn't perfect, because an expression can of course have a comma+space
-                  -- in it (e.g. a string literal), but that seems unlikely, so I don't want to invest more effort in
-                  -- this at the moment. I could not find a way to return the expressions in an array rather than a text
-                  -- - it seems our two options are do-or-do-not pass the column to pg_get_expr.
-                  & fillHoles
-                    "«bug»"
-                    ( maybe
-                        []
-                        (map (annotate (color Magenta) . pretty) . Text.splitOn ", ")
-                        index.expressions
-                    )
-                  & punctuate ", "
-                  & fold,
-                prettyIf index.isUnique " unique",
-                case index.predicate of
-                  Nothing -> mempty
-                  Just predicate -> " where " <> annotate (color Magenta) (pretty predicate),
-                case drop (fromIntegral @Int16 @Int index.numKeyColumns) index.columnNames of
-                  [] -> mempty
-                  -- fromJust is safe here because all non-key things are columns, i.e. you can't INCLUDE (foo + 1)
-                  names -> " → " <> fold (punctuate ", " (map (prettyColumnName . fromJust) names)),
-                line
+                line,
+                "│",
+                annotate underlined "Compound outgoing foreign key constraints",
+                line,
+                twoColumnForeignKeyConstraints
+                  & foldMap \c -> "│" <> prettyForeignKeyConstraint True c <> line
               ],
+      let twoColumnIncomingForeignKeyConstraints =
+            incomingForeignKeyConstraints
+              -- Filter out single-column foreign keys because we show them with the column, not at the bottom
+              & filter (not . one . (.sourceColumnNames))
+       in prettyIf (not (null twoColumnIncomingForeignKeyConstraints)) $
+            fold
+              [ "│",
+                line,
+                "│",
+                annotate underlined "Compound incoming foreign key references",
+                line,
+                twoColumnIncomingForeignKeyConstraints
+                  & foldMap \c -> "│" <> prettyIncomingForeignKeyConstraint True c <> line
+              ],
+      prettyIf (not (null twoColumnUniqueConstraints)) $
+        fold
+          [ "│",
+            line,
+            "│",
+            annotate underlined "Compound unique columns",
+            line,
+            twoColumnUniqueConstraints & foldMap \index ->
+              "│" <> prettyIndexKeyColumns index <> prettyUniqueMarker <> line
+          ],
+      prettyIf (not (null twoColumnCheckConstraints)) $
+        fold
+          [ "│",
+            line,
+            "│",
+            annotate underlined "Compound check constraints",
+            line,
+            twoColumnCheckConstraints & foldMap \constraint ->
+              "│" <> prettyCheckConstraintDefinition constraint.definition <> line
+          ],
+      prettyIf (not (null indexes)) $
+        fold
+          [ "│",
+            line,
+            "│",
+            annotate underlined "Indexes",
+            line,
+            indexes & foldMap \index ->
+              fold
+                [ "│",
+                  prettyIndexKeyColumns index,
+                  case index.predicate of
+                    Nothing -> mempty
+                    Just predicate -> " ∣ " <> annotate (color Magenta) (pretty predicate),
+                  case drop (fromIntegral @Int16 @Int index.numKeyColumns) index.columnNames of
+                    [] -> mempty
+                    -- fromJust is safe here because all non-key things are columns, i.e. you can't INCLUDE (foo + 1)
+                    names -> " +" <> fold (punctuate "," (map (prettyIndexColumnName . fromJust) names)),
+                  line
+                ]
+          ],
       "╰─"
     ]
   where
+    prettyIndexColumnName :: Text -> Doc AnsiStyle
+    prettyIndexColumnName =
+      annotate (color Green) . pretty
+
+    prettyIndexKeyColumns :: IndexRow -> Doc AnsiStyle
+    prettyIndexKeyColumns index =
+      prettyIndexKeyColumnsWith
+        prettyIndexColumnName
+        (annotate (color Magenta) . pretty)
+        index.columnNames
+        index.expressions
+        index.numKeyColumns
+
     getForeignKeyConstraints :: Text -> [ForeignKeyConstraintRow]
     getForeignKeyConstraints =
-      rowsByKey (getOne . (.sourceColumnNames)) (filter (one . (.sourceColumnNames)) foreignKeyConstraints)
+      rowsByMaybeKey (asOne . (.sourceColumnNames)) foreignKeyConstraints
 
     getIncomingForeignKeyConstraints :: Text -> [ForeignKeyConstraintRow]
     getIncomingForeignKeyConstraints =
-      rowsByKey (getOne . (.targetColumnNames)) (filter (one . (.targetColumnNames)) incomingForeignKeyConstraints)
+      rowsByMaybeKey (asOne . (.targetColumnNames)) incomingForeignKeyConstraints
 
     getOneColumnCheckConstraints :: Int16 -> [CheckConstraintRow]
     getOneColumnCheckConstraints =
-      rowsByKey (getOne . (.columns)) (filter (one . (.columns)) checkConstraints)
+      rowsByMaybeKey (asOne . (.columns)) checkConstraints
 
     twoColumnCheckConstraints :: [CheckConstraintRow]
     twoColumnCheckConstraints =
@@ -238,11 +296,26 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
         two (_ : _ : _) = True
         two _ = False
 
+    oneColumnUniqueConstraints :: Set Text
+    oneColumnUniqueConstraints =
+      indexes & foldMap \index ->
+        case (index.isUnique, index.columnNames) of
+          (True, [Just column]) -> Set.singleton column
+          _ -> Set.empty
+
+    twoColumnUniqueConstraints :: [IndexRow]
+    twoColumnUniqueConstraints =
+      filter (\index -> index.isUnique && index.numKeyColumns >= 2) indexes
+
     one [_] = True
     one _ = False
 
-    getOne [x] = x
-    getOne _ = undefined
+    asOne [x] = Just x
+    asOne _ = Nothing
+
+prettyUniqueMarker :: Doc AnsiStyle
+prettyUniqueMarker =
+  annotate (color Green) "*"
 
 prettyIf :: Bool -> Doc a -> Doc a
 prettyIf True x = x
