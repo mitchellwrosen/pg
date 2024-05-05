@@ -6,9 +6,8 @@ where
 import Data.Foldable (fold)
 import Data.Function ((&))
 import Data.Int (Int16)
+import Data.List qualified as List
 import Data.Maybe (fromJust)
-import Data.Set (Set)
-import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import PgPrettyUtils (prettyBytes, prettyInt)
@@ -31,17 +30,15 @@ import Witch (unsafeInto)
 
 prettyColumn ::
   ColumnRow ->
-  Bool ->
   [CheckConstraintRow] ->
   [ForeignKeyConstraintRow] ->
   [ForeignKeyConstraintRow] ->
   [Doc AnsiStyle]
-prettyColumn row unique checkConstraints foreignKeyConstraints incomingForeignKeyConststraints
-  | row.dropped = [annotate (color Black <> bold) "«dropped»"]
+prettyColumn row checkConstraints foreignKeyConstraints incomingForeignKeyConststraints
+  | row.dropped = []
   | otherwise =
       [ fold
           [ annotate (color Green <> bold) (pretty row.name),
-            prettyIf unique prettyUniqueMarker,
             " : ",
             annotate
               (color Yellow <> italicized)
@@ -164,10 +161,9 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
     [ "╭─",
       line,
       "│",
-      if table.visible
-        then prettyIf (table.schema /= "public") (annotate italicized ("(" <> pretty table.schema <> "." <> ")"))
-        else annotate bold (pretty table.schema) <> ".",
-      annotate bold (pretty table.name),
+      prettyIf (table.schema /= "public") $
+        annotate (bold <> underlined) (pretty table.schema) <> annotate underlined ".",
+      annotate (bold <> underlined) (pretty table.name),
       case table.type_ of
         Nothing -> mempty
         Just type_ -> " :: " <> annotate (color Yellow <> italicized) (pretty type_),
@@ -181,17 +177,26 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
             " | ",
             annotate (color Green) (prettyBytes (unsafeInto @Int table.bytes))
           ],
+      let droppedColumns = List.foldl' (\n column -> if column.dropped then n + 1 else n) (0 :: Int) columns
+       in prettyIf (droppedColumns > 0) $
+            fold
+              [ " | ",
+                annotate (color Black) $
+                  fold
+                    [ pretty droppedColumns,
+                      " dropped column",
+                      prettyIf (droppedColumns > 1) "s"
+                    ]
+              ],
       line,
-      "│",
+      prettyIf (not (null columns)) ("│" <> line),
       columns & foldMap \column ->
         prettyColumn
           column
-          (Set.member column.name oneColumnUniqueConstraints)
           (getOneColumnCheckConstraints column.num)
           (getForeignKeyConstraints column.name)
           (getIncomingForeignKeyConstraints column.name)
-          & foldMap \doc -> line <> "│" <> doc,
-      line,
+          & foldMap \doc -> "│" <> doc <> line,
       let twoColumnForeignKeyConstraints =
             foreignKeyConstraints
               -- Filter out single-column foreign keys because we show them with the column, not at the bottom
@@ -199,9 +204,6 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
        in prettyIf (not (null twoColumnForeignKeyConstraints)) $
             fold
               [ "│",
-                line,
-                "│",
-                annotate underlined "Compound outgoing foreign key constraints",
                 line,
                 twoColumnForeignKeyConstraints
                   & foldMap \c -> "│" <> prettyForeignKeyConstraint True c <> line
@@ -214,28 +216,19 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
             fold
               [ "│",
                 line,
-                "│",
-                annotate underlined "Compound incoming foreign key references",
-                line,
                 twoColumnIncomingForeignKeyConstraints
                   & foldMap \c -> "│" <> prettyIncomingForeignKeyConstraint True c <> line
               ],
-      prettyIf (not (null twoColumnUniqueConstraints)) $
+      prettyIf (not (null uniqueIndexes)) $
         fold
           [ "│",
             line,
-            "│",
-            annotate underlined "Compound unique columns",
-            line,
-            twoColumnUniqueConstraints & foldMap \index ->
-              "│" <> prettyIndexKeyColumns index <> prettyUniqueMarker <> line
+            uniqueIndexes & foldMap \index ->
+              "│" <> prettyIndexKeyColumns index <> " unique" <> line
           ],
       prettyIf (not (null twoColumnCheckConstraints)) $
         fold
           [ "│",
-            line,
-            "│",
-            annotate underlined "Compound check constraints",
             line,
             twoColumnCheckConstraints & foldMap \constraint ->
               "│" <> prettyCheckConstraintDefinition constraint.definition <> line
@@ -258,6 +251,8 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
                     [] -> mempty
                     -- fromJust is safe here because all non-key things are columns, i.e. you can't INCLUDE (foo + 1)
                     names -> " +" <> fold (punctuate "," (map (prettyIndexColumnName . fromJust) names)),
+                  " ",
+                  pretty index.method,
                   line
                 ]
           ],
@@ -296,26 +291,15 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
         two (_ : _ : _) = True
         two _ = False
 
-    oneColumnUniqueConstraints :: Set Text
-    oneColumnUniqueConstraints =
-      indexes & foldMap \index ->
-        case (index.isUnique, index.columnNames) of
-          (True, [Just column]) -> Set.singleton column
-          _ -> Set.empty
-
-    twoColumnUniqueConstraints :: [IndexRow]
-    twoColumnUniqueConstraints =
-      filter (\index -> index.isUnique && index.numKeyColumns >= 2) indexes
+    uniqueIndexes :: [IndexRow]
+    uniqueIndexes =
+      filter (.isUnique) indexes
 
     one [_] = True
     one _ = False
 
     asOne [x] = Just x
     asOne _ = Nothing
-
-prettyUniqueMarker :: Doc AnsiStyle
-prettyUniqueMarker =
-  annotate (color Green) "*"
 
 prettyIf :: Bool -> Doc a -> Doc a
 prettyIf True x = x

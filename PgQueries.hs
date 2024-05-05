@@ -195,7 +195,8 @@ data IndexRow = IndexRow
     columnNames :: ![Maybe Text], -- Nothing means hole for expression
     expressions :: !(Maybe Text),
     numKeyColumns :: !Int16,
-    predicate :: !(Maybe Text)
+    predicate :: !(Maybe Text),
+    method :: !Text
   }
   deriving stock (Generic)
   deriving anyclass (DecodeRow)
@@ -222,7 +223,12 @@ readIndexes oids =
         ) colnames,
         pg_catalog.pg_get_expr(i.indexprs, c1.oid, true) :: pg_catalog.text,
         i.indnkeyatts,
-        pg_catalog.pg_get_expr(i.indpred, c1.oid, true) :: pg_catalog.text
+        pg_catalog.pg_get_expr(i.indpred, c1.oid, true) :: pg_catalog.text,
+        ( SELECT a.amname
+          FROM pg_opclass o
+          JOIN pg_am a on o.opcmethod = a.oid
+          WHERE o.oid = i.indclass[0]
+        )
       FROM pg_catalog.pg_class AS c1
         JOIN pg_catalog.pg_index AS i ON c1.oid = i.indrelid
         JOIN pg_catalog.pg_class AS c2 ON i.indexrelid = c2.oid
