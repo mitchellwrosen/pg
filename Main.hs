@@ -17,6 +17,9 @@ import Data.Text.Encoding qualified as Text
 import Data.Text.IO.Utf8 qualified as Text
 import Data.Text.Read qualified as Text
 import Hasql.Connection qualified as Hasql
+import Hasql.Connection.Setting qualified
+import Hasql.Connection.Setting.Connection qualified
+import Hasql.Connection.Setting.Connection.Param qualified
 import Hasql.Session qualified as Hasql
 import Network.Socket qualified as Network
 import Options.Applicative (optional)
@@ -484,15 +487,17 @@ pgTables = do
   port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
   username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
   let settings =
-        Hasql.settings
-          (Text.encodeUtf8 host)
-          ( case Text.decimal port of
-              Right (port1, "") -> port1
-              _ -> 5432
-          )
-          (Text.encodeUtf8 username)
-          ByteString.empty
-          (Text.encodeUtf8 dbname)
+        [ Hasql.Connection.Setting.connection
+            ( Hasql.Connection.Setting.Connection.params
+                [ Hasql.Connection.Setting.Connection.Param.dbname dbname,
+                  Hasql.Connection.Setting.Connection.Param.host host,
+                  Hasql.Connection.Setting.Connection.Param.port case Text.decimal port of
+                    Right (port1, "") -> port1
+                    _ -> 5432,
+                  Hasql.Connection.Setting.Connection.Param.user username
+                ]
+            )
+        ]
   result <-
     bracket
       (Hasql.acquire settings)
