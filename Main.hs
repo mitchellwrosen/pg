@@ -79,6 +79,13 @@ main = do
             "down"
             (pure pgDown),
           subcommand
+            [ Opt.progDesc "Dump a Postgres database to a file."
+            ]
+            "dump"
+            ( pgDump
+                <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
+            ),
+          subcommand
             [ Opt.progDesc "Run a query on a Postgres cluster."
             ]
             "exec"
@@ -203,6 +210,34 @@ pgDown = do
     (readMaybe . Text.unpack -> Just pid) : _ -> Posix.signalProcess Posix.sigTERM pid
     _ -> Text.putStrLn ("Could not read PID from " <> postmasterFile)
 
+pgDump :: Maybe Text -> IO ()
+pgDump maybeDatabase = do
+  dbname <-
+    resolveValue (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) >>= \case
+      Nothing -> do
+        Text.putStrLn ("You must specify a database name with either `PGDATABASE` or `-d`.")
+        exitFailure
+      Just dbname -> pure dbname
+  host <- getStateDir
+  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
+  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  (out, err, code) <-
+    process
+      "pg_dump"
+      ( fold
+          [ ["-d", dbname],
+            ["-f", dbname <> ".pg_dump"],
+            ["-F", "c"],
+            ["-h", host],
+            ["-p", port],
+            ["-U", username]
+          ]
+      )
+  when (code /= ExitSuccess) do
+    Text.putStr out
+    Text.putStr err
+    exitWith code
+
 pgExec :: Text -> IO ()
 pgExec queryOrFilename = do
   dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
@@ -292,7 +327,8 @@ pgExplain maybeDatabase queryOrFilename parameters = do
       Text.putStrLn query
       case Aeson.eitherDecodeStrictText @[Analyze] out of
         Left parseError -> Text.putStrLn (Text.pack parseError)
-        Right (head -> analyze) -> putPretty (prettyAnalyze analyze)
+        Right (analyze : _) -> putPretty (prettyAnalyze analyze)
+        Right [] -> exitFailure
     else do
       Text.putStr out
       Text.putStr err
@@ -300,7 +336,7 @@ pgExplain maybeDatabase queryOrFilename parameters = do
 
 pgLoad :: Maybe Text -> Text -> IO ()
 pgLoad maybeDatabase file = do
-  dbname <- resolveValue (Def (Opt maybeDatabase) (pure "postgres"))
+  dbname <- resolveValue (Def (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) (pure "postgres"))
   host <- getStateDir
   port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
   username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
