@@ -27,7 +27,7 @@ import Options.Applicative qualified as Opt
 import PgPlan (Analyze)
 import PgPlanJson ()
 import PgPlanPretty (prettyAnalyze)
-import PgPostmasterPid (PostmasterPid (..), parsePostmasterPid)
+import PgPostmasterPid (parsePostmasterPid)
 import PgPrettyUtils (putPretty)
 import PgQueries qualified
 import PgTablePretty (prettyTable)
@@ -581,11 +581,11 @@ pgUp = do
                       assertSynchronousException exception
                       loop (tried + 1) Nothing
                     Right contents -> do
-                      postmasterPid <-
+                      port <-
                         parsePostmasterPid contents & onNothing do
                           Text.putStrLn ("Internal error: could not parse contents of file " <> postmasterFile)
                           exitFailure
-                      let unixSocketFile = postmasterPid.socketDir <> "/.s.PGSQL." <> postmasterPid.port
+                      let unixSocketFile = stateDir <> "/.s.PGSQL." <> port
                       loop2 tried (Network.SockAddrUnix (Text.unpack unixSocketFile))
                 Just unixSocketAddr -> loop2 tried unixSocketAddr
         loop2 tried unixSocketAddr =
@@ -762,7 +762,8 @@ withPipe action =
 ------------------------------------------------------------------------------------------------------------------------
 -- Directory utils
 
--- If in "$HOME/foo, returns "/foo"
+-- If in "$HOME, returns ""
+-- If in "$HOME/foo/bar, returns "/foo/bar"
 getCurrentDirectoryRelativeToHome :: IO (Maybe Text)
 getCurrentDirectoryRelativeToHome = do
   home <- Text.pack <$> Directory.getHomeDirectory
@@ -777,7 +778,11 @@ getStateDir = do
       Text.putStrLn "Error: not in home directory"
       exitFailure
   stateDir <- Directory.getXdgDirectory Directory.XdgState "pg-RnWBCkc"
-  pure (Text.pack stateDir <> currentDir)
+  pure (Text.pack stateDir <> "/" <> mangle currentDir)
+  where
+    mangle dir
+      | Text.null dir = "_"
+      | otherwise = Text.replace "/" "_" (Text.replace "_" "__" dir)
 
 ------------------------------------------------------------------------------------------------------------------------
 -- Misc utils and missing prelude functions
