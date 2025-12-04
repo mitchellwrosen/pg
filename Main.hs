@@ -10,6 +10,7 @@ import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
 import Data.List qualified as List
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Builder.Linear qualified as Text.Builder
@@ -180,6 +181,7 @@ main = do
                 <*> textOpt [Opt.metavar "HOST", Opt.short 'h']
                 <*> textOpt [Opt.metavar "PORT", Opt.short 'p']
                 <*> textOpt [Opt.metavar "USERNAME", Opt.short 'u']
+                <*> many (textArg [Opt.metavar "TABLE"])
             ),
           subcommand
             [ Opt.progDesc "Start a Postgres cluster."
@@ -479,8 +481,8 @@ pgSyntaxCreateIndex concurrently maybeIfNotExists include maybeName only maybeTa
     ]
 
 -- TODO: pg_class relpersistence, relispartition
-pgTables :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> IO ()
-pgTables maybeDatabase maybeHost maybePort maybeUsername = do
+pgTables :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> [Text] -> IO ()
+pgTables maybeDatabase maybeHost maybePort maybeUsername tableNamesFilter = do
   dbname <- resolveValue (Def (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) (pure "postgres"))
   host <-
     resolveValue $
@@ -540,15 +542,20 @@ pgTables maybeDatabase maybeHost maybePort maybeUsername = do
   let getIncomingForeignKeyConstraints = rowsByKey (.targetTableOid) incomingForeignKeyConstraints
   let getCheckConstraints = rowsByKey (.tableOid) checkConstraints
   let getIndexes = rowsByKey (.tableOid) indexes
+  let shouldPrintTable =
+        case tableNamesFilter of
+          [] -> \_ -> True
+          names -> let names1 = Set.fromList names in (`Set.member` names1)
   for_ tables \table ->
-    putPretty $
-      prettyTable
-        table
-        (getColumns table.oid)
-        (getForeignKeyConstraints table.oid)
-        (getIncomingForeignKeyConstraints table.oid)
-        (getCheckConstraints table.oid)
-        (getIndexes table.oid)
+    when (shouldPrintTable table.name) do
+      putPretty $
+        prettyTable
+          table
+          (getColumns table.oid)
+          (getForeignKeyConstraints table.oid)
+          (getIncomingForeignKeyConstraints table.oid)
+          (getCheckConstraints table.oid)
+          (getIndexes table.oid)
 
 pgUp :: IO ()
 pgUp = do
