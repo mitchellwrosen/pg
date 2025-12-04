@@ -170,7 +170,12 @@ main = do
             [ Opt.progDesc "List tables in a Postgres database."
             ]
             "tables"
-            (pure pgTables),
+            ( pgTables
+                <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
+                <*> textOpt [Opt.metavar "HOST", Opt.short 'h']
+                <*> textOpt [Opt.metavar "PORT", Opt.short 'p']
+                <*> textOpt [Opt.metavar "USERNAME", Opt.short 'u']
+            ),
           subcommand
             [ Opt.progDesc "Start a Postgres cluster."
             ]
@@ -469,13 +474,13 @@ pgSyntaxCreateIndex concurrently maybeIfNotExists include maybeName only maybeTa
     ]
 
 -- TODO: pg_class relpersistence, relispartition
-pgTables :: IO ()
-pgTables = do
-  dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
+pgTables :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> IO ()
+pgTables maybeDatabase maybeHost maybePort maybeUsername = do
+  dbname <- resolveValue (Def (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) (pure "postgres"))
   host <-
     resolveValue $
       Def
-        (TextEnv "PGHOST")
+        (Or (Opt maybeHost) (TextEnv "PGHOST"))
         ( do
             stateDir <- getStateDir
             let clusterDir = stateDir <> "/data"
@@ -484,8 +489,8 @@ pgTables = do
               exitFailure
             pure stateDir
         )
-  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
-  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  port <- resolveValue (Def (Or (Opt maybePort) (TextEnv "PGPORT")) (pure "5432"))
+  username <- resolveValue (Def (Or (Opt maybeUsername) (TextEnv "PGUSER")) (pure "postgres"))
   let settings =
         [ Hasql.Connection.Setting.connection
             ( Hasql.Connection.Setting.Connection.params
