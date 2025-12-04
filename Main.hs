@@ -119,7 +119,12 @@ main = do
             [ Opt.progDesc "Connect to a Postgres cluster."
             ]
             "repl"
-            (pure pgRepl),
+            ( pgRepl
+                <$> textOpt [Opt.metavar "DBNAME", Opt.short 'd']
+                <*> textOpt [Opt.metavar "HOST", Opt.short 'h']
+                <*> textOpt [Opt.metavar "PORT", Opt.short 'p']
+                <*> textOpt [Opt.metavar "USERNAME", Opt.short 'u']
+            ),
           subcommand
             [ Opt.progDesc "Print the syntax of Postgres DDL."
             ]
@@ -376,14 +381,14 @@ pgLogs = do
   Posix.touchFile (Text.encodeUtf8 logFile) -- in case we get here before postgres creates it
   void (foreground "tail" ["-f", logFile])
 
-pgRepl :: IO ()
-pgRepl = do
-  dbname <- resolveValue (Def (TextEnv "PGDATABASE") (pure "postgres"))
+pgRepl :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> IO ()
+pgRepl maybeDatabase maybeHost maybePort maybeUsername = do
+  dbname <- resolveValue (Def (Or (Opt maybeDatabase) (TextEnv "PGDATABASE")) (pure "postgres"))
   stateDir <- getStateDir
   host <-
     resolveValue $
       Def
-        (TextEnv "PGHOST")
+        (Or (Opt maybeHost) (TextEnv "PGHOST"))
         ( do
             let clusterDir = stateDir <> "/data"
             whenNotM (Directory.doesFileExist (Text.unpack (clusterDir <> "/postmaster.pid"))) do
@@ -391,8 +396,8 @@ pgRepl = do
               exitFailure
             pure stateDir
         )
-  port <- resolveValue (Def (TextEnv "PGPORT") (pure "5432"))
-  username <- resolveValue (Def (TextEnv "PGUSER") (pure "postgres"))
+  port <- resolveValue (Def (Or (Opt maybePort) (TextEnv "PGPORT")) (pure "5432"))
+  username <- resolveValue (Def (Or (Opt maybeUsername) (TextEnv "PGUSER")) (pure "postgres"))
   code <-
     foreground
       "psql"
