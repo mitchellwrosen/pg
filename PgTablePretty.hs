@@ -103,7 +103,7 @@ prettyForeignKeyConstraint showSource row =
   where
     prettyCols :: [Text] -> Doc AnsiStyle
     prettyCols =
-      annotate (colorDull Green) . pretty . Text.intercalate ","
+      fold . punctuate "," . map (annotate (colorDull Green) . pretty)
 
 prettyIncomingForeignKeyConstraint :: Bool -> ForeignKeyConstraintRow -> Doc AnsiStyle
 prettyIncomingForeignKeyConstraint showTarget row =
@@ -117,7 +117,7 @@ prettyIncomingForeignKeyConstraint showTarget row =
   where
     prettyCols :: [Text] -> Doc AnsiStyle
     prettyCols =
-      annotate (colorDull Green) . pretty . Text.intercalate ","
+      fold . punctuate "," . map (annotate (colorDull Green) . pretty)
 
 prettyIndexKeyColumnsWith :: (Text -> Doc a) -> (Text -> Doc a) -> [Maybe Text] -> Maybe Text -> Int16 -> Doc a
 prettyIndexKeyColumnsWith prettyColName prettyExpr columnNames expressions numKeyColumns =
