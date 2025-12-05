@@ -253,6 +253,12 @@ prettyTable table columns foreignKeyConstraints incomingForeignKeyConstraints ch
                     names -> " +" <> fold (punctuate "," (map (prettyIndexColumnName . fromJust) names)),
                   " ",
                   pretty index.method,
+                  " | ",
+                  annotate (color Green) (prettyBytes (unsafeInto @Int index.bytes)),
+                  " + ",
+                  annotate (color Green) (prettyBytes (unsafeInto @Int index.fsmBytes) <> " (fsm)"),
+                  " + ",
+                  annotate (color Green) (prettyBytes (unsafeInto @Int index.vmBytes) <> " (vm)"),
                   line
                 ]
           ],

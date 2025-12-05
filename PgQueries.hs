@@ -196,7 +196,10 @@ data IndexRow = IndexRow
     expressions :: !(Maybe Text),
     numKeyColumns :: !Int16,
     predicate :: !(Maybe Text),
-    method :: !Text
+    method :: !Text,
+    bytes :: !Int64,
+    fsmBytes :: !Int64,
+    vmBytes :: !Int64
   }
   deriving stock (Generic)
   deriving anyclass (DecodeRow)
@@ -210,8 +213,7 @@ readIndexes oids =
         c1.oid :: pg_catalog.int8,
         c2.relname :: pg_catalog.text,
         i.indisunique,
-        (
-          SELECT array_agg(a.attname :: pg_catalog.text ORDER BY n.r)
+        ( SELECT array_agg(a.attname :: pg_catalog.text ORDER BY n.r)
           FROM (
             SELECT row_number() OVER () r, n
             FROM (SELECT unnest(i.indkey) n) n
@@ -228,7 +230,10 @@ readIndexes oids =
           FROM pg_opclass o
           JOIN pg_am a on o.opcmethod = a.oid
           WHERE o.oid = i.indclass[0]
-        )
+        ),
+        pg_catalog.pg_relation_size(c2.oid, 'main'),
+        pg_catalog.pg_relation_size(c2.oid, 'fsm'),
+        pg_catalog.pg_relation_size(c2.oid, 'vm')
       FROM pg_catalog.pg_class AS c1
         JOIN pg_catalog.pg_index AS i ON c1.oid = i.indrelid
         JOIN pg_catalog.pg_class AS c2 ON i.indexrelid = c2.oid
@@ -266,7 +271,7 @@ readTables =
         c.relpersistence = 'u',
         pg_catalog.pg_table_is_visible(c.oid),
         c.reltuples,
-        (c.relpages :: pg_catalog.int8) * (current_setting('block_size') :: pg_catalog.int8)
+        pg_catalog.pg_relation_size(c.oid)
       FROM pg_catalog.pg_class AS c
         JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
       WHERE c.relkind = 'r'
