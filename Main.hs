@@ -10,6 +10,7 @@ import Data.Foldable (fold, for_)
 import Data.Function ((&))
 import Data.Functor (void)
 import Data.List qualified as List
+import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -187,7 +188,9 @@ main = do
             [ Opt.progDesc "Start a Postgres cluster."
             ]
             "up"
-            (pure pgUp)
+            ( pgUp
+                <$> textOpt [Opt.metavar "HOST", Opt.short 'h']
+            )
         ]
     ]
 
@@ -557,8 +560,8 @@ pgTables maybeDatabase maybeHost maybePort maybeUsername tableNamesFilter = do
           (getCheckConstraints table.oid)
           (getIndexes table.oid)
 
-pgUp :: IO ()
-pgUp = do
+pgUp :: Maybe Text -> IO ()
+pgUp maybeHost = do
   stateDir <- getStateDir
   let clusterDir = stateDir <> "/data"
   let logFile = stateDir <> "/log.txt"
@@ -575,8 +578,7 @@ pgUp = do
         [ ["-D", clusterDir],
           -- disable fsync
           ["-F"],
-          -- don't listen on IP
-          ["-h", ""],
+          ["-h", fromMaybe Text.empty maybeHost],
           -- unix socket directory
           ["-k", stateDir]
         ]
